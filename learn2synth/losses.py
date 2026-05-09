@@ -12,9 +12,16 @@ def _dot(x, y):
 def _make_activation(activation):
     if isinstance(activation, str):
         activation = getattr(nn, activation)
-    activation = (activation() if inspect.isclass(activation)
-                  else activation if callable(activation)
-    else None)
+    if inspect.isclass(activation):
+        # Softmax needs dim=1 for (B, C, *spatial) tensors
+        if activation is nn.Softmax:
+            activation = activation(dim=1)
+        else:
+            activation = activation()
+    elif callable(activation):
+        pass
+    else:
+        activation = None
     return activation
 
 
