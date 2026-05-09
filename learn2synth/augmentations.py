@@ -190,8 +190,14 @@ class FCDAugmentations:
         augmented : torch.Tensor  (Z, Y, X)
         """
         device    = synthetic.device
+        
+        # Guard: if input is already corrupted, bail out cleanly
+        if not torch.isfinite(synthetic).all():
+            bad = (~torch.isfinite(synthetic)).sum().item()
+            print(f"[WARN] hyperintensity received {bad} non-finite voxels in synthetic — returning as-is")
+            return synthetic  # don't make it worse; let caller decide
+        
         augmented = synthetic.clone()
-
         roi_mask_t = (roi > 0).float().to(device)
         hyper_map  = self.gaussian_blur_3d_torch(roi_mask_t, sigma, device)
         augmented  = augmented + hyper_map.to(augmented.dtype) * intensity_factor
