@@ -137,6 +137,11 @@ class FCDAugmentations:
         mask = (roi > 0).to(dtype).unsqueeze(0).unsqueeze(0)
 
         Z, Y, X = synthetic.shape
+        
+        # Guard: degenerate volume cannot be warped
+        if Z < 2 or Y < 2 or X < 2:
+            print(f"[WARN] apply_roi_thickening: degenerate shape {synthetic.shape} — returning as-is")
+            return synthetic, (roi > 0).float()
 
         nz = torch.nonzero(mask.squeeze())
         if nz.numel() == 0:
