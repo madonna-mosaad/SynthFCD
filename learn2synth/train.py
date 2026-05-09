@@ -230,23 +230,46 @@ class SynthSeg(nn.Module):
     def train_step(self, synth_image, synth_ref, real_image, real_ref):
         optim = self.optimizers()
         optim.zero_grad()
-
+    
+        # ── Internal step counter for logging ────────────────────────────────
+        if not hasattr(self, '_train_step_count'):
+            self._train_step_count = 0
+        self._train_step_count += 1
+        # ─────────────────────────────────────────────────────────────────────
+    
         # synth forward
         self.train()
         synth_pred = self.segnet(synth_image)
         synth_loss = self.loss(synth_pred, synth_ref)
+    
+        # ── Sanity check: skip catastrophic batches ───────────────────────────
+        if torch.isnan(synth_loss) or torch.isinf(synth_loss) or synth_loss.item() > 10.0:
+            print(f"[Skip] step={self._train_step_count} | Abnormal synth_loss={synth_loss.item():.3f} — skipping backward")
+            optim.zero_grad()
+            self.eval()
+            with torch.no_grad():
+                real_pred = self.segnet(real_image)
+                real_loss = self.loss(real_pred, real_ref)
+            return synth_loss, real_loss
+        # ─────────────────────────────────────────────────────────────────────
+    
         if self.backward:
             self.backward(synth_loss)
         else:
             synth_loss.backward()
+    
+        # ── Grad norm logging (no clipping, pure diagnostics) ─────────────────
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.segnet.parameters(), float('inf'))
+        print(f"[GradNorm] step={self._train_step_count} | loss={synth_loss.item():.4f} | norm={grad_norm:.4f}")
+        # ─────────────────────────────────────────────────────────────────────
+    
         optim.step()
-
+    
         self.eval()
         with torch.no_grad():
-            # real forward
             real_pred = self.segnet(real_image)
             real_loss = self.loss(real_pred, real_ref)
-
+    
         return synth_loss, real_loss
 
     def eval_step(self, synth_image, synth_ref, real_image, real_ref):
