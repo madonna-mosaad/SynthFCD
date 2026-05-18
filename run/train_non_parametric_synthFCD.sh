@@ -20,6 +20,8 @@ python ../scripts/train_non_parametric_synthFCD.py fit \
   --data.batch_size 2 \
   --data.num_workers 4 \
   --data.eval 0.2 \
+  --data.fcd_intensity_range "[0.02, 0.3602]" \
+  --data.fcd_tail_range "[14, 29]" \
   --data.split_seed 42 \
   --data.use_extra_data true \
   \
