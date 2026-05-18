@@ -10,6 +10,7 @@ import datetime
 import traceback
 import warnings
 import re
+import csv
 
 from typing import Sequence, Optional
 from os     import path, makedirs
@@ -853,7 +854,7 @@ class Model(pl.LightningModule):
             time_limit_minutes: float = None,
             flair_modality: bool = False,
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
-            n_best_batches: int = 2,
+            n_tracked_batches: int = 2,
             native_synthesis: bool = False,
             val_diagnostics_interval: int = 10,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
@@ -907,8 +908,8 @@ class Model(pl.LightningModule):
         self.network.set_backward(self.manual_backward)
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.n_best_batches    = n_best_batches
-        self._val_batch_cache  = []   # top-n_best_batches entries by lowest loss
+        self.n_tracked_batches    = n_tracked_batches
+        self._val_batch_cache  = []   # top-n_tracked_batches entries by lowest loss
         self._val_worst_cache  = []   # 1 entry with highest loss
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1410,6 +1411,7 @@ class Model(pl.LightningModule):
         _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
                   input_format='index')
         subj_metrics = []
+
         for j, subj_id in enumerate(subject_ids):
             if subj_id is None:
                 continue
@@ -1438,7 +1440,24 @@ class Model(pl.LightningModule):
                 self.log(f'val_dice_{subj_id}', subj_dice, prog_bar=False)
                 self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
 
-        # ── Cache for NIfTI diagnostics — best N + worst 1 ────────────────────────
+        # ── Write all subject metrics to CSV every val_diagnostics_interval epochs ──
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and subj_metrics:
+            base_dir = self.trainer.log_dir or self.trainer.default_root_dir
+            csv_path = os.path.join(base_dir, 'subject_metrics.csv')
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['epoch', 'subject_id', 'dice', 'fcd_dice'])
+                if write_header:
+                    writer.writeheader()
+                for m in subj_metrics:
+                    writer.writerow({
+                        'epoch': self.trainer.current_epoch,
+                        'subject_id': m['id'],
+                        'dice': round(m['dice'], 4),
+                        'fcd_dice': round(m['fcd'], 4),
+                    })
+
+        # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
         entry = {
             'pred_synth': pred_synth.cpu(),
             'pred_labels': pred_labels,
@@ -1452,15 +1471,15 @@ class Model(pl.LightningModule):
             'subj_metrics': subj_metrics,
         }
 
-        # Best cache: keep top-n_best_batches by highest score (lowest loss)
+        # Best cache: keep top-n_tracked_batches by highest score (lowest loss)
         self._val_batch_cache.append(entry)
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
-        self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
+        self._val_batch_cache = self._val_batch_cache[:self.n_tracked_batches]
 
-        # Worst cache: keep 1 by lowest score (highest loss)
+        # Worst cache: keep top-n_tracked_batches by lowest score (highest loss)
         self._val_worst_cache.append(entry)
         self._val_worst_cache.sort(key=lambda x: x['score'])  # ascending = worst first
-        self._val_worst_cache = self._val_worst_cache[:1]
+        self._val_worst_cache = self._val_worst_cache[:self.n_tracked_batches]
 
         return loss
 
@@ -1861,35 +1880,6 @@ class LossGraphCallback(Callback):
                   f"{type(e).__name__}: {e}")
             traceback.print_exc()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EveryEpochCheckpointCallback
-# ──────────────────────────────────────────────────────────────────────────────
-#  Writes checkpoints/<filename> unconditionally after every training epoch.
-#  Does not depend on ModelCheckpoint, metric improvements, or save_last logic.
-#  This is the canonical file used for resuming.
-#
-#  Uses trainer.save_checkpoint() directly — bypasses all of ModelCheckpoint's
-#  link/top-k/metric-gating logic.
-# ══════════════════════════════════════════════════════════════════════════════
-class EveryEpochCheckpointCallback(Callback):
-    def __init__(self, filename="resume.ckpt"):
-        self.filename = filename
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        ckpt_dir = os.path.join(trainer.default_root_dir, "checkpoints")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(ckpt_dir, self.filename)
-        try:
-            trainer.save_checkpoint(ckpt_path)
-            size_mb = os.path.getsize(ckpt_path) / 1e6
-            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(ckpt_path))
-        except Exception as e:
-            print(f"[EveryEpoch] ❌ Save FAILED at epoch "
-                  f"{trainer.current_epoch}: {type(e).__name__}: {e}")
-            traceback.print_exc()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  CheckpointTraceCallback
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1945,7 +1935,6 @@ class CLI(LightningCLI):
 
         # Registration order matters: EveryEpoch writes resume.ckpt first,
         # then CheckpointTrace inspects it, then LossGraph plots.
-        cbs.append(EveryEpochCheckpointCallback(filename="resume.ckpt"))
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
 
