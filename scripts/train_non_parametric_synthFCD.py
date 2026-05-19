@@ -1451,18 +1451,20 @@ class Model(pl.LightningModule):
         if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and subj_metrics:
             base_dir = self.trainer.log_dir or self.trainer.default_root_dir
             csv_path = os.path.join(base_dir, 'subject_metrics.csv')
+
+            # Build wide-format row: one column pair per subject
+            row = {'epoch': self.trainer.current_epoch}
+            for m in subj_metrics:
+                row[f"{m['id']} (dice)"] = round(m['dice'], 4)
+                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'], 4)
+
+            # Append to CSV — write header only on first write
             write_header = not os.path.exists(csv_path)
             with open(csv_path, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['epoch', 'subject_id', 'dice', 'fcd_dice'])
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
                 if write_header:
                     writer.writeheader()
-                for m in subj_metrics:
-                    writer.writerow({
-                        'epoch': self.trainer.current_epoch,
-                        'subject_id': m['id'],
-                        'dice': round(m['dice'], 4),
-                        'fcd_dice': round(m['fcd'], 4),
-                    })
+                writer.writerow(row)
 
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
         entry = {
