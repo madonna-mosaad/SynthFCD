@@ -887,37 +887,37 @@ class Model(pl.LightningModule):
             save_once_per_subject=True,
         )
 
-        self.optimizer_name       = optimizer
-        self.optimizer_options    = dict(optimizer_options or {'lr': 1e-4})
-        self.time_limit_minutes   = time_limit_minutes
-        self.alpha                = alpha
-        self.flair_stats_csv      = flair_stats_csv
-        self.target_labels        = self.TARGET_LABELS
-        self.val_diagnostics_interval  = val_diagnostics_interval
+        self.optimizer_name           = optimizer
+        self.optimizer_options        = dict(optimizer_options or {'lr': 1e-4})
+        self.time_limit_minutes       = time_limit_minutes
+        self.alpha                    = alpha
+        self.flair_stats_csv          = flair_stats_csv
+        self.target_labels            = self.TARGET_LABELS
+        self.val_diagnostics_interval = val_diagnostics_interval
 
         # ── Sub-modules ───────────────────────────────────────────────────────
-        self.subject_params_cache   = self._load_subject_params()
-        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features, seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
-        synth                       = self._build_synth(flair_modality)
-        loss_fn                     = self._build_loss(loss)
-        self.network                = SynthSeg(seg_net, synth, loss_fn)
-        self.intensity_aug          = self._build_intensity_aug()
-        self.rimg_normalizer        = cc.QuantileTransform(clip=True)
-        self.fcd_aug                = FCDAugmentations()
+        self.subject_params_cache     = self._load_subject_params()
+        seg_net                       = self._build_seg_network(ndim, nb_classes, seg_features, seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        synth                         = self._build_synth(flair_modality)
+        loss_fn                       = self._build_loss(loss)
+        self.network                  = SynthSeg(seg_net, synth, loss_fn)
+        self.intensity_aug            = self._build_intensity_aug()
+        self.rimg_normalizer          = cc.QuantileTransform(clip=True)
+        self.fcd_aug                  = FCDAugmentations()
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        _m                  = dict(include_background=False, num_classes=nb_classes, input_format='index')
-        self.val_dice       = dice_compute(average='micro', **_m)
-        self.val_dice_fcd   = dice_compute(average='none',  **_m)
+        _m                            = dict(include_background=False, num_classes=nb_classes, input_format='index')
+        self.val_dice                 = dice_compute(average='micro', **_m)
+        self.val_dice_fcd             = dice_compute(average='none',  **_m)
 
         # ── Manual optimisation ───────────────────────────────────────────────
-        self.automatic_optimization = False
+        self.automatic_optimization   = False
         self.network.set_backward(self.manual_backward)
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.n_tracked_batches    = n_tracked_batches
-        self._val_batch_cache  = []   # top-n_tracked_batches entries by lowest loss
-        self._val_worst_cache  = []   # 1 entry with highest loss
+        self.n_tracked_batches        = n_tracked_batches
+        self._val_batch_cache         = []   # top-n_tracked_batches entries by lowest loss
+        self._val_worst_cache         = []   # 1 entry with highest loss
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -989,10 +989,10 @@ class Model(pl.LightningModule):
         if not (self.flair_stats_csv and os.path.exists(self.flair_stats_csv)):
             return cache
         try:
-            df = pd.read_csv(self.flair_stats_csv)
+            df            = pd.read_csv(self.flair_stats_csv)
             df['subject'] = df['subject'].astype(str).str.strip()
             # range(19): covers classes 0–18 inclusive (WM-GM Separator = 18)
-            default_keys = set(range(19)) | set(FLAIR_CLASS_PARAMS.keys())
+            default_keys  = set(range(19)) | set(FLAIR_CLASS_PARAMS.keys())
 
             for subj in df['subject'].unique():
                 params = {
@@ -1233,9 +1233,9 @@ class Model(pl.LightningModule):
                 )
 
             # simg exits SharedSynth already in [0,1] — no manual normalization needed
-            simg_3d = simg.squeeze(0).float()
+            simg_3d        = simg.squeeze(0).float()
 
-            aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
+            aug_out        = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
             # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────
@@ -1286,14 +1286,14 @@ class Model(pl.LightningModule):
         if is_debug:
             dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
 
-        choices = self._parse_aug_choices(aug_type)
+        choices          = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
         # ── Debug: Stage 2 — after FCDAugmentations ───────────────────────────────
         if is_debug:
             dbg.save_stage2_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
 
-        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
+        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
         # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
@@ -1307,10 +1307,10 @@ class Model(pl.LightningModule):
         if is_debug:
             dbg.save_stage3_after_intensity(subject_id, aug_image_item)
 
-        slab_with_fcd = slab_3d.clone()
+        slab_with_fcd              = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
-        rlab_with_fcd = rlab.long().squeeze(0).clone()
+        rlab_with_fcd              = rlab.long().squeeze(0).clone()
         rlab_with_fcd[rroi_3d > 0] = 6
 
         # ── Debug: Stage 4 — after label fusion ───────────────────────────────────
@@ -1342,11 +1342,11 @@ class Model(pl.LightningModule):
         Returns stacked tensors + a list of subject_ids that survived synthesis
         (samples that returned None are excluded from both).
         """
-        results      = []
-        subject_ids  = []
-        n            = len(batch['label_t'])
-        sid_list     = batch.get('subject_id', [None] * n)
-        device_type  = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        results     = []
+        subject_ids = []
+        n           = len(batch['label_t'])
+        sid_list    = batch.get('subject_id', [None] * n)
+        device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
 
         with torch.autocast(device_type=device_type, enabled=False):
             for i in range(n):
@@ -1402,13 +1402,13 @@ class Model(pl.LightningModule):
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
 
-        pred_labels = pred_real.cpu().argmax(dim=1)
-        target_labels = real_mask.cpu().squeeze(1).long()
+        pred_labels       = pred_real.cpu().argmax(dim=1)
+        target_labels     = real_mask.cpu().squeeze(1).long()
 
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
-        loss = loss_synth + self.alpha * loss_real
+        loss              = loss_synth + self.alpha * loss_real
         actual_batch_size = aug_image.shape[0]
 
         self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
@@ -1416,7 +1416,7 @@ class Model(pl.LightningModule):
         # ── Per-subject metrics ────────────────────────────────────────────────────
         # Computes Dice + FCD Dice per subject for cache and optional logging.
         # Logging only fires every val_diagnostics_interval epochs.
-        _m = dict(include_background=False, num_classes=self.hparams.nb_classes, input_format='index')
+        _m           = dict(include_background=False, num_classes=self.hparams.nb_classes, input_format='index')
         subj_metrics = []
 
         for j, subj_id in enumerate(subject_ids):
@@ -1424,9 +1424,9 @@ class Model(pl.LightningModule):
                 continue
 
             subj_pred_labels = pred_labels[j:j + 1]
-            subj_target = target_labels[j:j + 1]
+            subj_target      = target_labels[j:j + 1]
             subj_pred_logits = pred_real[j:j + 1]
-            subj_mask = real_mask[j:j + 1]
+            subj_mask        = real_mask[j:j + 1]
 
             # Dice — fresh metric instance to avoid state bleed between subjects
             _dice = dice_compute(average='micro', **_m)
@@ -1438,14 +1438,14 @@ class Model(pl.LightningModule):
             _dice_fcd.update(subj_pred_labels, subj_target)
 
             subj_dice_per_cls = _dice_fcd.compute()
-            subj_fcd = subj_dice_per_cls[5].item() if len(subj_dice_per_cls) > 5 else 0.0
+            subj_fcd          = subj_dice_per_cls[5].item() if len(subj_dice_per_cls) > 5 else 0.0
 
             subj_metrics.append({'id': subj_id, 'dice': subj_dice, 'fcd': subj_fcd})
 
             # ── Log every val_diagnostics_interval epochs ──────────────────────────
             if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
                 subj_loss = self.network.loss(subj_pred_logits, subj_mask)
-                self.log(f'val_dice_{subj_id}', subj_dice, prog_bar=False)
+                self.log(f'val_dice_{subj_id}', subj_dice,        prog_bar=False)
                 self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
 
         # ── Write all subject metrics to CSV every val_diagnostics_interval epochs ──
@@ -1456,8 +1456,8 @@ class Model(pl.LightningModule):
             # Build wide-format row: one column pair per subject
             row = {'epoch': self.trainer.current_epoch}
             for m in subj_metrics:
-                row[f"{m['id']} (dice)"] = round(m['dice'], 4)
-                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'], 4)
+                row[f"{m['id']} (dice)"]     = round(m['dice'], 4)
+                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'],  4)
 
             # Append to CSV — write header only on first write
             write_header = not os.path.exists(csv_path)
@@ -1469,16 +1469,16 @@ class Model(pl.LightningModule):
 
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
         entry = {
-            'pred_synth': pred_synth.cpu(),
-            'pred_labels': pred_labels,
-            'aug_image': aug_image.cpu(),
-            'real_image': real_image.cpu(),
-            'aug_mask': aug_mask.cpu(),
+            'pred_synth':    pred_synth.cpu(),
+            'pred_labels':   pred_labels,
+            'aug_image':     aug_image.cpu(),
+            'real_image':    real_image.cpu(),
+            'aug_mask':      aug_mask.cpu(),
             'target_labels': target_labels,
-            'score': -loss.item(),  # higher score = lower loss = better
-            'batch_idx': batch_idx,
-            'subject_ids': subject_ids,
-            'subj_metrics': subj_metrics,
+            'score':         -loss.item(),  # higher score = lower loss = better
+            'batch_idx':     batch_idx,
+            'subject_ids':   subject_ids,
+            'subj_metrics':  subj_metrics,
         }
 
         # Guard against None from checkpoint resume with renamed hparam (was n_best_batches)
@@ -1491,10 +1491,10 @@ class Model(pl.LightningModule):
 
         # Worst cache: keep top-n by lowest score (highest loss),
         # excluding any batch already in the best cache to avoid overlap
-        best_idxs = {e['batch_idx'] for e in self._val_batch_cache}
+        best_idxs             = {e['batch_idx'] for e in self._val_batch_cache}
 
         self._val_worst_cache.append(entry)
-        self._val_worst_cache.sort(key=lambda x: x['score'])  # ascending = worst first
+        self._val_worst_cache.sort(key=lambda x: x['score'])   # ascending = worst first
         self._val_worst_cache = [
             e for e in self._val_worst_cache if e['batch_idx'] not in best_idxs
         ][:n]
@@ -1510,7 +1510,7 @@ class Model(pl.LightningModule):
             aug_mask,
             real_labels,
             subject_id: str = 'unknown',
-            rank: str = 'best',
+            rank: str       = 'best',
     ):
         """
         Log class-count scalars and save NIfTI samples every 10 epochs.
@@ -1529,7 +1529,7 @@ class Model(pl.LightningModule):
         self.log('pred_synth_num_classes',
                  float(len(torch.unique(pred_synth_argmax))), prog_bar=False)
         self.log('pred_real_num_classes',
-                 float(len(torch.unique(pred_real_argmax))), prog_bar=False)
+                 float(len(torch.unique(pred_real_argmax))),  prog_bar=False)
 
         if self.trainer.current_epoch % self.hparams.val_diagnostics_interval != 0:
             return
@@ -1557,8 +1557,8 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                subject_id=subject_id,
-                rank='best',
+                subject_id = subject_id,
+                rank       = 'best',
             )
 
         for bd in self._val_worst_cache:
@@ -1570,25 +1570,25 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                subject_id=subject_id,
-                rank='worst',
+                subject_id = subject_id,
+                rank       = 'worst',
             )
 
         # ── Epoch-level metrics ───────────────────────────────────────────────────
-        dice_epoch = self.val_dice.compute()
+        dice_epoch   = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
-        dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
+        dice_fcd     = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
 
-        self.log('val_dice', dice_epoch, prog_bar=True)
-        self.log('val_dice_fcd', dice_fcd, prog_bar=False)
+        self.log('val_dice',     dice_epoch, prog_bar=True)
+        self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
         # ── Step LR scheduler manually (required with automatic_optimization=False) ──
         sch = self.lr_schedulers()
         if sch is not None:
             sch.step(self.trainer.callback_metrics.get('eval_loss'))
 
-        tl = self.trainer.callback_metrics.get('train_loss', -1)
-        el = self.trainer.callback_metrics.get('eval_loss', -1)
+        tl         = self.trainer.callback_metrics.get('train_loss', -1)
+        el         = self.trainer.callback_metrics.get('eval_loss', -1)
         current_lr = self.optimizers().param_groups[0]['lr']
 
         print(f"\n{'=' * 40}")
