@@ -917,7 +917,8 @@ class Model(pl.LightningModule):
         # ── State ─────────────────────────────────────────────────────────────
         self.n_tracked_batches        = n_tracked_batches
         self._val_batch_cache         = []   # top-n_tracked_batches entries by lowest loss
-        self._val_worst_cache         = []   # 1 entry with highest loss
+        self._val_worst_cache         = []   # top-n_tracked_batches entries by highest loss
+        self._val_all_subj_metrics    = []   # all subjects across all val batches this epoch
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -1448,24 +1449,9 @@ class Model(pl.LightningModule):
                 self.log(f'val_dice_{subj_id}', subj_dice,        prog_bar=False)
                 self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
 
-        # ── Write all subject metrics to CSV every val_diagnostics_interval epochs ──
-        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and subj_metrics:
-            base_dir = self.trainer.log_dir or self.trainer.default_root_dir
-            csv_path = os.path.join(base_dir, 'subject_metrics.csv')
-
-            # Build wide-format row: one column pair per subject
-            row = {'epoch': self.trainer.current_epoch}
-            for m in subj_metrics:
-                row[f"{m['id']} (dice)"]     = round(m['dice'], 4)
-                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'],  4)
-
-            # Append to CSV — write header only on first write
-            write_header = not os.path.exists(csv_path)
-            with open(csv_path, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-                if write_header:
-                    writer.writeheader()
-                writer.writerow(row)
+        # ── Accumulate all subjects across batches for epoch-end CSV + print ──────
+        if subj_metrics:
+            self._val_all_subj_metrics.extend(subj_metrics)
 
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
         entry = {
@@ -1547,7 +1533,7 @@ class Model(pl.LightningModule):
         save(real_labels[0].to(torch.uint8),          os.path.join(subj_dir, 'real-ref.nii.gz'))
 
     def on_validation_epoch_end(self):
-        # ── Save NIfTI diagnostics for best N + worst 1 cached batches ───────────
+        # ── Save NIfTI diagnostics for best N + worst N cached batches ───────────
         for bd in self._val_batch_cache:
             subject_id = bd['subject_ids'][0] if bd['subject_ids'] else 'unknown'
             self._log_val_diagnostics(
@@ -1599,19 +1585,31 @@ class Model(pl.LightningModule):
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
 
-        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 \
+                and self._val_all_subj_metrics:
             print(f"  ── Subject Diagnostics ────────────────")
-            for bd in self._val_batch_cache:
-                for m in bd.get('subj_metrics', []):
-                    print(f"  best  {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
-            for bd in self._val_worst_cache:
-                for m in bd.get('subj_metrics', []):
-                    print(f"  worst {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
+            for m in self._val_all_subj_metrics:
+                print(f"  {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
+
+            # ── Write all subjects to CSV ─────────────────────────────────────────
+            base_dir = self.trainer.log_dir or self.trainer.default_root_dir
+            csv_path = os.path.join(base_dir, 'subject_metrics.csv')
+            row = {'epoch': self.trainer.current_epoch}
+            for m in self._val_all_subj_metrics:
+                row[f"{m['id']} (dice)"]     = round(m['dice'], 4)
+                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'],  4)
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
 
         print(f"{'=' * 40}\n")
 
-        self._val_batch_cache = []
-        self._val_worst_cache = []
+        self._val_batch_cache      = []
+        self._val_worst_cache      = []
+        self._val_all_subj_metrics = []
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
@@ -1901,8 +1899,8 @@ class LossGraphCallback(Callback):
 # ══════════════════════════════════════════════════════════════════════════════
 #  CheckpointTraceCallback
 # ──────────────────────────────────────────────────────────────────────────────
-#  Diagnostic callback — verifies resume.ckpt and last.ckpt behave as expected
-#  each epoch. Fires after EveryEpochCheckpointCallback so resume.ckpt is
+#  Diagnostic callback — verifies last.ckpt and last.ckpt behave as expected
+#  each epoch. Fires after EveryEpochCheckpointCallback so last.ckpt is
 #  already written when we inspect it.
 # ══════════════════════════════════════════════════════════════════════════════
 class CheckpointTraceCallback(Callback):
@@ -1951,7 +1949,7 @@ class CLI(LightningCLI):
 
         cbs = kwargs.get("callbacks", []) or []
 
-        # Registration order matters: EveryEpoch writes resume.ckpt first,
+        # Registration order matters: EveryEpoch writes last.ckpt first,
         # then CheckpointTrace inspects it, then LossGraph plots.
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
