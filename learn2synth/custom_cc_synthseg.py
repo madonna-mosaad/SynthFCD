@@ -233,10 +233,18 @@ class SynthFromLabelTransform(torch.nn.Module):
             │      RandomGaussianMixtureTransform    (fallback when class_params=None)
             │
             ▼  [3] Intensity augmentation  (disabled when no_augs=True)
-                   cc.IntensityTransform — bias field, gamma, noise, resolution
+            │      cc.IntensityTransform — bias field, gamma, noise, resolution
+            │      ends with QuantileTransform → output always [0, 1]
+            │
+            ▼  [3b] GMM normalization  (only when no_augs=True)
+                   QuantileTransform(clip=True) — maps 1st–99th percentile to [0, 1]
+                   Replicates what cc.IntensityTransform would have done, so that
+                   simg always exits this transform in [0, 1] regardless of path.
 
     In the FCD training pipeline, ``no_augs=True`` is used so that:
     - Intensity augmentation is applied downstream after FCD augmentations.
+    - GMM output is still normalized here to [0, 1] via QuantileTransform(clip=True),
+      matching the output range of the no_augs=False path.
 
     Parameters
     ----------
@@ -244,6 +252,7 @@ class SynthFromLabelTransform(torch.nn.Module):
         Number of output image channels (default 1 — single FLAIR channel).
     no_augs : bool
         Disable intensity augmentation only — deformation always runs.
+        GMM output is still normalized to [0, 1] via QuantileTransform.
     class_params : dict, optional
         Per-class GMM params. Falls back to the legacy single-range GMM when None.
     use_per_class_gmm : bool
@@ -296,10 +305,14 @@ class SynthFromLabelTransform(torch.nn.Module):
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
         # ── Post-GMM intensity augmentation ───────────────────────────────────
-        # no_augs disables intensity only — deformation is always active
-        self.intensity = do_nothing if no_augs else cc.IntensityTransform(
+        # no_augs disables intensity only — deformation is always active.
+        # When no_augs=True, self.normalizer is applied instead to bring the
+        # raw GMM output (~0-255) into [0, 1], matching the output range of
+        # cc.IntensityTransform (which always ends with QuantileTransform).
+        self.intensity  = do_nothing if no_augs else cc.IntensityTransform(
             bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
         )
+        self.normalizer = cc.QuantileTransform(clip=True)
 
     def forward(self, x: torch.Tensor, coreg=None):
         """
@@ -316,7 +329,7 @@ class SynthFromLabelTransform(torch.nn.Module):
 
         Returns
         -------
-        img   : Tensor (1, D, H, W)          — synthetic FLAIR image
+        img   : Tensor (1, D, H, W)          — synthetic FLAIR image, always [0, 1]
         x     : Tensor (n_classes, D, H, W)  — deformed one-hot label map
         coreg : Tensor or list[Tensor]        — only when coreg was provided
         """
@@ -359,6 +372,14 @@ class SynthFromLabelTransform(torch.nn.Module):
             )
         else:
             img = self.intensity(x)
+
+        # ── Stage 3: GMM normalization (no_augs=True path only) ──────────────
+        # When no_augs=False, cc.IntensityTransform already ends with
+        # QuantileTransform — img is already [0, 1].
+        # When no_augs=True, self.intensity is do_nothing — GMM output is raw
+        # FLAIR scale (~0-255). Normalize here so simg always exits [0, 1].
+        if self.no_augs:
+            img = self.normalizer.make_final(img)(img)
 
         # ── Return ────────────────────────────────────────────────────────────
         if coreg is not None:

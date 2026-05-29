@@ -235,33 +235,9 @@ class DiceLoss(Loss):
 
 
 class CatLoss(Loss):
-    r"""Weighted categorical cross-entropy.
+    r"""Weighted categorical cross-entropy."""
 
-    By default, each class is weighted *identically*.
-    /!\ This differs from the classical "categorical cross-entropy loss",
-    /!\ which corresponds to the true Categorical log-likelihood and where
-    /!\ classes are therefore weighted by frequency. The default behavior
-    /!\ of our loss is that of a "weighted categorical cross-entropy".
-    The `weighted` mode allows classes to be weighted by frequency.
-    """
-
-    def __init__(self, weighted=False, labels=None,
-                 reduction='mean', activation=None):
-        """
-
-        Parameters
-        ----------
-        weighted : bool or list[float], default=False
-            If True, weight the term of each class by its frequency
-             in the reference. If a list, use these weights for each class.
-        labels : list[int], default=range(nb_class)
-            Label corresponding to each one-hot class. Only used if the
-            reference is an integer label map.
-        reduction : {'mean', 'sum', None} or callable, default='mean'
-            Type of reduction to apply across minibatch elements.
-        activation : nn.Module or str
-            Activation to apply to the prediction before computing the loss
-        """
+    def __init__(self, weighted=False, labels=None, reduction='mean', activation=None):
         super().__init__(reduction)
         self.weighted = weighted
         self.labels = labels
@@ -269,48 +245,49 @@ class CatLoss(Loss):
         self.activation = _make_activation(activation)
 
     def forward_onehot(self, pred, ref, mask, weights):
-
         nb_classes = pred.shape[1]
         if ref.shape[1] != nb_classes:
-            raise ValueError(f'Number of classes not consistent. '
-                             f'Expected {nb_classes} but got {ref.shape[1]}.')
+            raise ValueError(f'Number of classes not consistent.')
 
         ref = ref.to(pred)
+
         if mask is not None:
             pred = pred * mask
             ref = ref * mask
 
-        # Compute dot(ref, log(pred)) / dot(ref, 1)
         pred = pred.reshape([*pred.shape[:2], -1])  # [B, C, N]
         ref = ref.reshape([*ref.shape[:2], -1])  # [B, C, N]
-        loss = _dot(pred, ref)  # [B, C]
-        ref = ref.sum(-1)  # [B, C]
-        loss = loss / ref  # [B, C]
 
-        # Simple or weighted average
+        # Compute dot(ref, log(pred))
+        loss = _dot(pred, ref)  # [B, C]
+        ref_sum = ref.sum(-1).clamp_min(1e-5)  # Prevent division by zero
+        loss = loss / ref_sum  # [B, C]
+
         if weights is not False:
             if weights is True:
-                weights = ref / ref.sum(dim=1, keepdim=True)
+                weights = ref_sum / ref_sum.sum(dim=1, keepdim=True).clamp_min(1e-5)
             loss = loss * weights
             loss = loss.sum(-1)
         else:
             loss = loss.mean(-1)
 
-        # Minibatch reduction
+        # Standard CE Negation
         return self.reduce(loss.neg_())
 
     def forward_labels(self, pred, ref, mask, weights):
-
         nb_classes = pred.shape[1]
         labels = self.labels or list(range(nb_classes))
 
         loss = 0
-        sumweights = 0
+        sum_weights = 0
+
         for index, label in enumerate(labels):
             if label is None:
                 continue
+
             pred1 = pred[:, index]
-            ref1 = (ref == label).squeeze(1)
+            ref1 = (ref == label).squeeze(1).float()
+
             if mask is not None:
                 pred1 = pred1 * mask
                 ref1 = ref1 * mask
@@ -318,63 +295,42 @@ class CatLoss(Loss):
             pred1 = pred1.reshape([len(pred1), -1])  # [B, N]
             ref1 = ref1.reshape([len(ref1), -1])  # [B, N]
 
-            # Compute term
             loss1 = (pred1 * ref1).sum(-1)  # [B]
+            ref_sum = ref1.sum(-1).clamp_min(1e-5)  # out-of-place, consistent with forward_onehot
+            loss1 = loss1 / ref_sum
 
-            # --- FIX: Ensure ref1 is float before clamping ---
-            ref1 = ref1.float().sum(-1)  # [B]
-
-            loss1 = loss1 / ref1.clamp_min_(1e-5)
-
-            # Simple or weighted average
             if weights is not False:
                 if weights is True:
-                    weight1 = ref1
+                    weight1 = ref_sum
                 else:
                     weight1 = float(weights[index])
+
                 loss1 = loss1 * weight1
-                sumweights += weight1
+                sum_weights += weight1
             else:
-                sumweights += 1
+                sum_weights += 1
+
             loss += loss1
 
-        # Minibatch reduction
-        loss = loss / sumweights
-        loss = 1 - loss
-        return self.reduce(loss)
+        loss = loss / sum_weights
+        return self.reduce(loss.neg_())
 
     def forward(self, pred, ref, mask=None):
-        """
-
-        Parameters
-        ----------
-        pred : (batch, nb_class, *spatial) tensor
-            Predicted classes.
-        ref : (batch, nb_class|1, *spatial) tensor
-            Reference classes (or their expectation).
-        mask : (batch, 1, *spatial) tensor, optional
-            Loss mask
-
-        Returns
-        -------
-        loss : scalar or (batch,) tensor
-            The output shape depends on the type of reduction used.
-            If 'mean' or 'sum', this function returns a scalar tensor.
-
-        """
         if self.activation:
             pred = self.activation(pred)
 
         nb_classes = pred.shape[1]
         backend = dict(dtype=pred.dtype, device=pred.device)
 
+        # FIX: Clamp probabilities BEFORE log to avoid log(0) -> -inf
+        pred = pred.clamp(min=1e-7, max=1.0)
         pred = pred.log()
-        pred.masked_fill_(~torch.isfinite(pred), 0)
 
-        # prepare weights
         weighted = self.weighted
+
         if not torch.is_tensor(weighted) and not weighted:
             weighted = False
+
         if not isinstance(weighted, bool):
             weighted = utils.make_vector(weighted, nb_classes, **backend)
 
@@ -713,10 +669,8 @@ class DiceCELoss(Loss):
         # Initialize sub-losses.
         # We pass activation=None because the activation is handled
         # in the forward pass of this wrapper class to ensure consistency.
-        self.dice = DiceLoss(square=square, weighted=weighted, labels=labels,
-                             eps=eps, reduction=reduction, activation=None)
-        self.ce = CatLoss(weighted=weighted, labels=labels,
-                          reduction=reduction, activation=None)
+        self.dice   = DiceLoss(square=square, weighted=weighted, labels=labels, eps=eps, reduction=reduction, activation=None)
+        self.ce     = CatLoss(                weighted=weighted, labels=labels,          reduction=reduction, activation=None)
 
     def forward(self, pred, ref, mask=None):
         """

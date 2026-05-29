@@ -1,35 +1,49 @@
 """FCD SynthSeg – 7-class FCD lesion segmentation (background + 5 tissue groups + FCD lesion)."""
+
 # ── Standard library ────────────────────────────────────────────────────────
 import os
 import sys
 import glob
 import math
 import random
-import shutil
 import datetime
 import traceback
-from typing import Sequence, Optional
+import warnings
+import re
+import csv
 
-from os import path, makedirs
+from typing import Sequence, Optional
+from os     import path, makedirs
 from random import shuffle
 
+# ── Warning suppression (before Lightning/torch imports) ────────────────────
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="mistune")
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="nbconvert")
+warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
+warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
+warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
+warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
+warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*deprecated.*")
+
 # ── Third-party libraries ───────────────────────────────────────────────────
-import numpy as np
-import pandas as pd
+import numpy             as np
+import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
-import nibabel as nib
+import nibabel           as nib
 
-import pytorch_lightning as pl
-from pytorch_lightning.cli import LightningCLI
+import pytorch_lightning         as pl
+from pytorch_lightning.cli       import LightningCLI
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from pytorch_lightning.loggers   import CSVLogger, TensorBoardLogger
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data          import Dataset, DataLoader
 from torchmetrics.segmentation import DiceScore as dice_compute
 
-import cornucopia as cc
-from cornucopia import SynthFromLabelTransform, IntensityTransform
+import cornucopia       as cc
+from cornucopia         import SynthFromLabelTransform, IntensityTransform
 from cornucopia.special import IdentityTransform
 
 # NOTE: GaussianSmooth is currently unused → remove if not needed
@@ -40,15 +54,16 @@ from cornucopia.special import IdentityTransform
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
+
 # ── Local modules (learn2synth) ─────────────────────────────────────────────
-from learn2synth.networks import UNet, SegNet
-from learn2synth.train import SynthSeg
-from learn2synth.losses import (
+from learn2synth.networks      import UNet, SegNet
+from learn2synth.train         import SynthSeg
+from learn2synth.losses        import (
     DiceLoss, LogitMSELoss, CatLoss, CatMSELoss,
     DiceCELoss, FocalTverskyLoss,
 )
-from learn2synth import optim
-from learn2synth.parameters import FCDParameterCalculator
+from learn2synth               import optim
+from learn2synth.parameters    import FCDParameterCalculator
 from learn2synth.augmentations import FCDAugmentations
 
 from learn2synth.custom_cc_synthseg import (
@@ -72,7 +87,6 @@ from learn2synth.configurations import (
     THICKENING_SUBJECTS,
 )
 
-
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
 # Actual GPU synthesis happens inside Model.synthesize_batch
@@ -83,14 +97,14 @@ class FCDDataset(Dataset):
             label_paths,
             flair_paths,
             roi_paths,
-            fused_paths=None,
-            native_synthesis: bool = False,
-            fcd_intensity_range=(0.02, 0.3602),
-            fcd_tail_length_range=(20, 50),
-            blur_sigma_range=(0.7, 1.7),
-            zoom_f_range=(0.75, 0.95),
-            hyper_sigma_range=(0.0, 0.3),
-            trans_sigma_range=(0.0, 0.3)
+            fused_paths                  = None,
+            native_synthesis: bool       = False,
+            fcd_intensity_range          = (0.02, 0.3602),
+            fcd_tail_length_range        = (20, 50),
+            blur_sigma_range             = (0.7, 1.7),
+            zoom_f_range                 = (0.75, 0.95),
+            hyper_sigma_range            = (0.0, 0.3),
+            trans_sigma_range            = (0.0, 0.3)
     ):
         """
         Args:
@@ -103,27 +117,27 @@ class FCDDataset(Dataset):
             hyper_sigma_range: Range for gray matter hyperintensity noise.
             trans_sigma_range: Range for transmantle signal intensity noise.
         """
-        self.ndim = ndim
-        self.native_synthesis = native_synthesis
+        self.ndim                  = ndim
+        self.native_synthesis      = native_synthesis
 
-        self.fcd_intensity_range = fcd_intensity_range
+        self.fcd_intensity_range   = fcd_intensity_range
         self.fcd_tail_length_range = fcd_tail_length_range
 
         # Store augmentation hyperparameters for external configurability
-        self.blur_sigma_range = blur_sigma_range
-        self.zoom_f_range = zoom_f_range
-        self.hyper_sigma_range = hyper_sigma_range
-        self.trans_sigma_range = trans_sigma_range
+        self.blur_sigma_range      = blur_sigma_range
+        self.zoom_f_range          = zoom_f_range
+        self.hyper_sigma_range     = hyper_sigma_range
+        self.trans_sigma_range     = trans_sigma_range
 
-        self.items = []
+        self.items                 = []
 
         # Initialize stateless utility once to minimize instantiation overhead during loading
-        self._calc = FCDParameterCalculator()
+        self._calc                 = FCDParameterCalculator()
 
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-        
+
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -146,12 +160,12 @@ class FCDDataset(Dataset):
         # --- Volume Loading (I/O) ---
         flair_arr = nib.load(flair_path).get_fdata()
         label_arr = nib.load(label_path).get_fdata().astype(int)
-        roi_arr = nib.load(roi_path).get_fdata().astype(int)
+        roi_arr   = nib.load(roi_path).get_fdata().astype(int)
 
         # --- Spatial Standardization ---
         # Resample ROI and labels to match FLAIR space using shared utility instance
         if flair_arr.shape != roi_arr.shape:
-            roi_arr = (self._calc.resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
+            roi_arr   = (self._calc.resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
         if flair_arr.shape != label_arr.shape:
             label_arr = self._calc.resample_to_target(label_arr, flair_arr.shape, True).astype(int)
 
@@ -159,35 +173,35 @@ class FCDDataset(Dataset):
         # Data is prepared for the CNN pipeline (C, H, W, D format)
         label_tensor = torch.as_tensor(label_arr, dtype=torch.int64).unsqueeze(0)
         flair_tensor = torch.as_tensor(flair_arr, dtype=torch.float32).unsqueeze(0)
-        roi_tensor = torch.as_tensor(roi_arr, dtype=torch.int64).unsqueeze(0)
+        roi_tensor   = torch.as_tensor(roi_arr,   dtype=torch.int64).unsqueeze(0)
 
         # --- Parameter Exposure ---
         # Construct augmentation parameters from instance ranges.
         # These are passed as tensors to ensure consistency across worker processes.
         aug_params = {
-            'int_factor_min': torch.tensor(self.fcd_intensity_range[0], dtype=torch.float32),
-            'int_factor_max': torch.tensor(self.fcd_intensity_range[1], dtype=torch.float32),
+            'int_factor_min':  torch.tensor(self.fcd_intensity_range[0],   dtype=torch.float32),
+            'int_factor_max':  torch.tensor(self.fcd_intensity_range[1],   dtype=torch.float32),
             'tail_length_min': torch.tensor(self.fcd_tail_length_range[0], dtype=torch.long),
             'tail_length_max': torch.tensor(self.fcd_tail_length_range[1], dtype=torch.long),
 
-            'blur_sigma_min': torch.tensor(self.blur_sigma_range[0], dtype=torch.float32),
-            'blur_sigma_max': torch.tensor(self.blur_sigma_range[1], dtype=torch.float32),
+            'blur_sigma_min':  torch.tensor(self.blur_sigma_range[0],      dtype=torch.float32),
+            'blur_sigma_max':  torch.tensor(self.blur_sigma_range[1],      dtype=torch.float32),
 
-            'zoom_f_min': torch.tensor(self.zoom_f_range[0], dtype=torch.float32),
-            'zoom_f_max': torch.tensor(self.zoom_f_range[1], dtype=torch.float32),
+            'zoom_f_min':      torch.tensor(self.zoom_f_range[0],          dtype=torch.float32),
+            'zoom_f_max':      torch.tensor(self.zoom_f_range[1],          dtype=torch.float32),
 
-            'hyper_sigma_min': torch.tensor(self.hyper_sigma_range[0], dtype=torch.float32),
-            'hyper_sigma_max': torch.tensor(self.hyper_sigma_range[1], dtype=torch.float32),
+            'hyper_sigma_min': torch.tensor(self.hyper_sigma_range[0],     dtype=torch.float32),
+            'hyper_sigma_max': torch.tensor(self.hyper_sigma_range[1],     dtype=torch.float32),
 
-            'trans_sigma_min': torch.tensor(self.trans_sigma_range[0], dtype=torch.float32),
-            'trans_sigma_max': torch.tensor(self.trans_sigma_range[1], dtype=torch.float32),
+            'trans_sigma_min': torch.tensor(self.trans_sigma_range[0],     dtype=torch.float32),
+            'trans_sigma_max': torch.tensor(self.trans_sigma_range[1],     dtype=torch.float32),
         }
 
         item = {
-            'label_t': label_tensor,
-            'flair_t': flair_tensor,
-            'roi_t': roi_tensor,
-            'aug_type': aug_type,
+            'label_t':    label_tensor,
+            'flair_t':    flair_tensor,
+            'roi_t':      roi_tensor,
+            'aug_type':   aug_type,
             'subject_id': os.path.basename(os.path.dirname(label_path)),
             **aug_params,
         }
@@ -226,41 +240,45 @@ class FCDDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
-                 ndim: int = 3,
-                 dataset_path: str = DEFAULT_FOLDER,
-                 eval: float = 0.04,
-                 preshuffle: bool = False,
-                 batch_size: int = 1,
-                 shuffle: bool = True,
-                 num_workers: int = 4,
-                 native_synthesis: bool = False,
-                 train_subdir: str = 'train',
-                 raw_subdir: Optional[str] = 'raw',
-                 extra_subdirs: Optional[list] = None,
-                 use_extra_data: bool = False):
+                 ndim: int                            = 3,
+                 dataset_path: str                    = DEFAULT_FOLDER,
+                 eval: float                          = 0.04,
+                 preshuffle: bool                     = False,
+                 split_seed: int                      = 42,
+                 batch_size: int                      = 1,
+                 shuffle: bool                        = True,
+                 num_workers: int                     = 4,
+                 native_synthesis: bool               = False,
+                 train_subdir: str                    = 'train',
+                 raw_subdir: Optional[str]            = 'raw',
+                 extra_subdirs: Optional[list]        = None,
+                 use_extra_data: bool                 = False,
+                 fcd_intensity_range: Optional[tuple] = None,
+                 fcd_tail_range:      Optional[tuple] = None):
         super().__init__()
 
         # --- Config ---
-        self.ndim = ndim
-        self.dataset_path = dataset_path
-        self.eval_frac = eval
-        self.preshuffle = preshuffle
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.num_workers = num_workers
+        self.ndim             = ndim
+        self.dataset_path     = dataset_path
+        self.eval_frac        = eval
+        self.preshuffle       = preshuffle
+        self.split_seed       = split_seed
+        self.batch_size       = batch_size
+        self.shuffle          = shuffle
+        self.num_workers      = num_workers
         self.native_synthesis = native_synthesis
-        self.use_extra_data = use_extra_data
+        self.use_extra_data   = use_extra_data
 
         # --- Resolve directory layout ---
         if raw_subdir is None:
-            self.use_extra_data = False
+            self.use_extra_data    = False
             self.val_from_raw_only = False
             print("[FCDDataModule] raw_subdir=None — scanning train_subdir directly, use_extra_data forced False.")
         elif extra_subdirs is None:
-            extra_subdirs = ['generated']
+            extra_subdirs          = ['generated']
 
-        train_root = path.join(dataset_path, train_subdir)
-        raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
+        train_root  = path.join(dataset_path, train_subdir)
+        raw_root    = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
         extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
 
         # --- Helper: scan one directory for valid triplets (+ fusedmask when native_synthesis) ---
@@ -316,12 +334,12 @@ class FCDDataModule(pl.LightningDataModule):
         # --- Store split-ready pools ---
         self._raw_label_paths = raw_label_paths
         self._raw_flair_paths = raw_flair_paths
-        self._raw_roi_paths = raw_roi_paths
+        self._raw_roi_paths   = raw_roi_paths
         self._raw_fused_paths = raw_fused_paths
 
         self._extra_label_paths = extra_label_paths
         self._extra_flair_paths = extra_flair_paths
-        self._extra_roi_paths = extra_roi_paths
+        self._extra_roi_paths   = extra_roi_paths
         self._extra_fused_paths = extra_fused_paths
 
         print(
@@ -331,37 +349,55 @@ class FCDDataModule(pl.LightningDataModule):
         )
 
         if not self.native_synthesis:
-            print("[FCDDataModule] Computing FCD augmentation parameters…")
-            self._calc = FCDParameterCalculator()
-            self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
-                dataset_path=raw_root,
-                label_file=label_file,
-                flair_file=flair_file,
-                roi_file=roi_file,
-                intensity_subjects=INTENSITY_SUBJECTS,
-                transmantle_subjects=TRANSMANTLE_SUBJECTS,
-                auto_resample=True,
-            )
+            if fcd_intensity_range is not None and fcd_tail_range is not None:
+                self.fcd_intensity_range = fcd_intensity_range
+                self.fcd_tail_range = fcd_tail_range
+            else:
+                print("[FCDDataModule] Computing FCD augmentation parameters…")
+                self._calc = FCDParameterCalculator()
+                self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+                    dataset_path         = raw_root,
+                    label_file           = label_file,
+                    flair_file           = flair_file,
+                    roi_file             = roi_file,
+                    intensity_subjects   = INTENSITY_SUBJECTS,
+                    transmantle_subjects = TRANSMANTLE_SUBJECTS,
+                    auto_resample        = True,
+                )
         else:
             print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
             self.fcd_intensity_range = (0.0, 0.0)
-            self.fcd_tail_range = (0, 0)
+            self.fcd_tail_range      = (0, 0)
 
     def setup(self, stage=None):
         if hasattr(self, '_setup_done'):
             return
         self._setup_done = True
 
-        # Copy raw pool (and shuffle if requested) before splitting
+        # Copy raw pool before splitting
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
         raw_roi_paths = list(self._raw_roi_paths)
         raw_fused_paths = list(self._raw_fused_paths)
 
-        if self.preshuffle:
+        # Shuffle raw pool before splitting — seeded (preshuffle=False) or unseeded (preshuffle=True)
+        # fused_paths excluded from zip when native_synthesis=False (empty list crashes zip)
+        if self.native_synthesis:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+        else:
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+
+        if self.split_seed != 0:
+            if combined:
+                if self.preshuffle:
+                    shuffle(combined)
+                else:
+                    random.Random(self.split_seed).shuffle(combined)
+
+                if self.native_synthesis:
+                    raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+                else:
+                    raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
@@ -373,19 +409,19 @@ class FCDDataModule(pl.LightningDataModule):
 
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
-        val_roi_paths = raw_roi_paths[:n_val]
-        val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
+        val_roi_paths   = raw_roi_paths[:n_val]
+        val_fused_paths = raw_fused_paths[:n_val]
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
-        train_raw_roi_paths = raw_roi_paths[n_val:]
-        train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
+        train_raw_roi_paths   = raw_roi_paths[n_val:]
+        train_raw_fused_paths = raw_fused_paths[n_val:]
 
         # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
-        train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
-        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
+        train_roi_paths   = train_raw_roi_paths   + list(self._extra_roi_paths)
+        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)
 
         print(
             f"[FCDDataModule] Split: "
@@ -394,30 +430,28 @@ class FCDDataModule(pl.LightningDataModule):
         )
 
         kw = dict(
-            fcd_intensity_range=self.fcd_intensity_range,
-            fcd_tail_length_range=self.fcd_tail_range,
+            fcd_intensity_range   = self.fcd_intensity_range,
+            fcd_tail_length_range = self.fcd_tail_range,
         )
 
         self.train_ds = FCDDataset(
             self.ndim, train_label_paths, train_flair_paths, train_roi_paths,
-            fused_paths=train_fused_paths,
-            native_synthesis=self.native_synthesis,
+            fused_paths      = train_fused_paths,
+            native_synthesis = self.native_synthesis,
             **kw,
         )
         self.eval_ds = FCDDataset(
             self.ndim, val_label_paths, val_flair_paths, val_roi_paths,
-            fused_paths=val_fused_paths,
-            native_synthesis=self.native_synthesis,
+            fused_paths      = val_fused_paths,
+            native_synthesis = self.native_synthesis,
             **kw,
         )
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
+        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers > 0)
 
     def val_dataloader(self):
-        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
+        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers > 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,8 +471,8 @@ class SharedSynth(torch.nn.Module):
 
     def __init__(self, synth, target_labels=None, native_synthesis: bool = False):
         super().__init__()
-        self.synth = synth
-        self.target_labels = target_labels or []
+        self.synth            = synth
+        self.target_labels    = target_labels or []
         self.native_synthesis = native_synthesis
 
     # ------------------------------------------------------------------
@@ -504,13 +538,13 @@ class SharedSynth(torch.nn.Module):
         else:
             slab_synth = slab
 
-        final = self.synth.make_final(slab_synth, 1)
+        final        = self.synth.make_final(slab_synth, 1)
         final.deform = final.deform.make_final(slab_synth)
         simg, slab_out = final(slab_synth)
 
         if roi is not None:
             rimg, rlab, rroi = final.deform([img, lab, roi])
-            rlab = final.postproc(rlab)
+            rlab             = final.postproc(rlab)
             return simg, slab_out, rimg, rlab, rroi
         else:
             rimg, rlab = final.deform([img, lab])
@@ -531,17 +565,20 @@ class SharedSynth(torch.nn.Module):
                                  already encoded as label 21 and remapped to class 6.
         """
         if roi is not None:
-            oh_slab = self._to_one_hot(slab)  # (19, D, H, W)
-            simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
-            slab_out = self.remap_labels(slab)
-            rlab_out = self.remap_labels(rlab)
+            oh_slab                                    = self._to_one_hot(slab)  # (19, D, H, W)
+            simg, oh_slab_deformed, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
+            slab_deformed                              = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out                                   = self.remap_labels(slab_deformed)
+            rlab_out                                   = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, rroi
         else:
-            oh_slab = self._to_one_hot(slab, num_classes=22)  # (22, D, H, W) — label 21 gets its own channel
-            simg, _, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
-            slab_out = self.remap_labels(slab)
-            rlab_out = self.remap_labels(rlab)
+            oh_slab                              = self._to_one_hot(slab, num_classes=22)
+            simg, oh_slab_deformed, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
+            slab_deformed                        = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out                             = self.remap_labels(slab_deformed)
+            rlab_out                             = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -573,7 +610,7 @@ class SharedSynth(torch.nn.Module):
             all else → class 0 (Background)
         """
         max_value = int(label_map.max().item()) + 1
-        lut = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
+        lut       = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
 
         for class_index, group in enumerate(self.target_labels, start=1):
             for value in group:
@@ -581,12 +618,14 @@ class SharedSynth(torch.nn.Module):
                     lut[value] = class_index
 
         if self.native_synthesis and 21 < max_value:
-            lut[21] = 6  # FCD lesion remapped from fusedmask label 21
-        nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
+            lut[21] = 6                               # FCD lesion remapped from fusedmask label 21
+
+        nb_classes = len(self.target_labels) + 1      # 6: background + 5 tissues
         if self.native_synthesis:
-            nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
+            nb_classes += 1                           # +1 to accommodate class 6 (FCD lesion)
 
         return torch.clamp(lut[label_map.float().round().long()], 0, nb_classes - 1)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
@@ -621,7 +660,6 @@ class SharedSynth(torch.nn.Module):
 #      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
 #      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SynthesisPipelineDebugger:
     """
     Saves intermediate volumes at every synthesis stage for selected subjects.
@@ -644,10 +682,10 @@ class SynthesisPipelineDebugger:
         output_root: str,
         save_once_per_subject: bool = True,
     ):
-        self.debug_subject_ids = set(debug_subject_ids)
-        self.output_root = output_root
-        self.save_once = save_once_per_subject
-        self._saved: set = set()  # tracks which subjects have already been saved
+        self.debug_subject_ids     = set(debug_subject_ids)
+        self.output_root           = output_root
+        self.save_once             = save_once_per_subject
+        self._saved: set           = set()  # tracks which subjects have already been saved
         self._aug_type_cache: dict = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -670,17 +708,18 @@ class SynthesisPipelineDebugger:
     ):
         """Stage 0 — raw tensors loaded from disk, before any processing."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(label_t.squeeze(),  out_dir, "stage0_input_labelmap.nii.gz",  dtype=np.int16)
-        self._save_nii(flair_t.squeeze(),  out_dir, "stage0_input_flair.nii.gz",     dtype=np.float32)
-        self._save_nii(roi_t.squeeze(),    out_dir, "stage0_input_roi.nii.gz",        dtype=np.uint8)
+
+        self._save_nii(label_t.squeeze(), out_dir, "stage0_input_labelmap.nii.gz", dtype=np.int16)
+        self._save_nii(flair_t.squeeze(), out_dir, "stage0_input_flair.nii.gz",    dtype=np.float32)
+        self._save_nii(roi_t.squeeze(),   out_dir, "stage0_input_roi.nii.gz",      dtype=np.uint8)
         if fusedmask_t is not None:
             self._save_nii(fusedmask_t.squeeze(), out_dir, "stage0_input_fusedmask.nii.gz", dtype=np.int16)
+
         self._log_stats(subject_id, "stage0_input_labelmap",  label_t)
         self._log_stats(subject_id, "stage0_input_flair",     flair_t)
         self._log_stats(subject_id, "stage0_input_roi",       roi_t)
         if fusedmask_t is not None:
             self._log_stats(subject_id, "stage0_input_fusedmask", fusedmask_t)
-        print(f"[PipelineDebug] {subject_id} | Stage 0 saved → {out_dir}")
 
     def save_stage1_after_synth(
         self,
@@ -693,59 +732,62 @@ class SynthesisPipelineDebugger:
     ):
         """Stage 1 — output of SharedSynth: deformed + GMM-sampled synthetic image."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(simg.squeeze(),    out_dir, "stage1_after_synth_simg.nii.gz",  dtype=np.float32)
-        self._save_nii(slab_out.squeeze(),out_dir, "stage1_after_synth_slab.nii.gz",  dtype=np.int16)
-        self._save_nii(rimg.squeeze(),    out_dir, "stage1_after_synth_rimg.nii.gz",  dtype=np.float32)
-        self._save_nii(rlab_out.squeeze(),out_dir, "stage1_after_synth_rlab.nii.gz",  dtype=np.int16)
+
+        self._save_nii(simg.squeeze(),     out_dir, "stage1_after_synth_simg.nii.gz", dtype=np.float32)
+        self._save_nii(slab_out.squeeze(), out_dir, "stage1_after_synth_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rimg.squeeze(),     out_dir, "stage1_after_synth_rimg.nii.gz", dtype=np.float32)
+        self._save_nii(rlab_out.squeeze(), out_dir, "stage1_after_synth_rlab.nii.gz", dtype=np.int16)
         if rroi is not None:
             self._save_nii(rroi.squeeze(), out_dir, "stage1_after_synth_rroi.nii.gz", dtype=np.uint8)
-        self._log_stats(subject_id, "stage1_simg",    simg)
-        self._log_stats(subject_id, "stage1_slab_out",slab_out)
-        self._log_stats(subject_id, "stage1_rimg",    rimg)
-        self._log_stats(subject_id, "stage1_rlab_out",rlab_out)
-        print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
 
-    def save_stage2_after_clamp(self, subject_id: str, simg_clamped: torch.Tensor):
-        """Stage 2 — after /255 clamp to [0,1] on flair path (skipped on non-flair path)."""
-        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(simg_clamped.squeeze(), out_dir, "stage2_after_clamp.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage2_after_clamp", simg_clamped)
-        print(f"[PipelineDebug] {subject_id} | Stage 2 (clamp) saved → {out_dir}")
+        self._log_stats(subject_id, "stage1_simg",     simg)
+        self._log_stats(subject_id, "stage1_slab_out", slab_out)
+        self._log_stats(subject_id, "stage1_rimg",     rimg)
+        self._log_stats(subject_id, "stage1_rlab_out", rlab_out)
 
-    def save_stage3_after_fcd_aug(
+
+    def save_stage2_after_fcd_aug(
         self,
         subject_id: str,
         aug_img: torch.Tensor,
         rroi_3d: torch.Tensor,
         choices: list,
     ):
-        """Stage 3 — after FCDAugmentations (SynthFCD path only)."""
+        """Stage 2 — after FCDAugmentations (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(aug_img.squeeze(),  out_dir, "stage3_after_fcd_aug.nii.gz",     dtype=np.float32)
-        self._save_nii(rroi_3d.squeeze(),  out_dir, "stage3_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
-        self._log_stats(subject_id, f"stage3_after_fcd_aug (choices={choices})", aug_img)
-        print(f"[PipelineDebug] {subject_id} | Stage 3 (FCD aug: {choices}) saved → {out_dir}")
 
-    def save_stage4_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
-        """Stage 4 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
+        self._save_nii(aug_img.squeeze(), out_dir, "stage2_after_fcd_aug.nii.gz",     dtype=np.float32)
+        self._save_nii(rroi_3d.squeeze(), out_dir, "stage2_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
+
+        self._log_stats(subject_id, f"stage2_after_fcd_aug (choices={choices})", aug_img)
+
+    def save_stage3_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
+        """Stage 3 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(aug_image_item.squeeze(), out_dir, "stage4_after_intensity.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage4_after_intensity", aug_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 4 (intensity aug) saved → {out_dir}")
+        self._save_nii(aug_image_item.squeeze(), out_dir, "stage3_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage3_after_intensity", aug_image_item)
 
-    def save_stage5_label_fusion(
+    def save_stage4_label_fusion(
         self,
         subject_id: str,
         slab_with_fcd: torch.Tensor,
         rlab_with_fcd: torch.Tensor,
     ):
-        """Stage 5 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
+        """Stage 4 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage5_label_fused_slab.nii.gz", dtype=np.int16)
-        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage5_label_fused_rlab.nii.gz", dtype=np.int16)
-        self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
-        self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
-        print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
+
+        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage4_label_fused_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage4_label_fused_rlab.nii.gz", dtype=np.int16)
+
+        self._log_stats(subject_id, "stage4_slab_with_fcd", slab_with_fcd)
+        self._log_stats(subject_id, "stage4_rlab_with_fcd", rlab_with_fcd)
+
+
+    def save_stage5_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
+        """Stage 5 — final rimg after IntensityTransform, normalized to [0,1]."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(real_image_item.squeeze(), out_dir, "stage5_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage5_after_intensity", real_image_item)
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -761,7 +803,7 @@ class SynthesisPipelineDebugger:
 
     def _subject_dir(self, subject_id: str, aug_type: str = "") -> str:
         folder = f"{subject_id}-{aug_type.replace('+', '-')}" if aug_type else subject_id
-        d = os.path.join(self.output_root, folder)
+        d      = os.path.join(self.output_root, folder)
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -774,7 +816,7 @@ class SynthesisPipelineDebugger:
 
     def _log_stats(self, subject_id: str, stage_name: str, tensor: torch.Tensor):
         try:
-            t = tensor.detach().cpu().float()
+            t    = tensor.detach().cpu().float()
             line = (
                 f"[{stage_name}] "
                 f"shape={tuple(t.shape)}  "
@@ -789,7 +831,6 @@ class SynthesisPipelineDebugger:
                 f.write(line)
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
@@ -820,8 +861,9 @@ class Model(pl.LightningModule):
             time_limit_minutes: float = None,
             flair_modality: bool = False,
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
-            n_best_batches: int = 2,
+            n_tracked_batches: int = 2,
             native_synthesis: bool = False,
+            val_diagnostics_interval: int = 10,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
     ):
@@ -838,41 +880,45 @@ class Model(pl.LightningModule):
         # Example CLI usage:
         #   --model.debug_subject_ids '["sub-00001", "sub-00027", "sub-00065"]'
         modality_tag = "flair" if flair_modality else "random"
-        synth_tag = "native" if native_synthesis else "synthFCD"
+        synth_tag    = "native" if native_synthesis else "synthFCD"
         self._pipeline_debugger = SynthesisPipelineDebugger(
             debug_subject_ids=set(debug_subject_ids or []),
             output_root=os.path.join(OUTPUT_FOLDER, f"pipeline_debug_{modality_tag}_{synth_tag}"),
             save_once_per_subject=True,
         )
 
-        self.optimizer_name       = optimizer
-        self.optimizer_options    = dict(optimizer_options or {'lr': 1e-4})
-        self.time_limit_minutes   = time_limit_minutes
-        self.alpha                = alpha
-        self.flair_stats_csv      = flair_stats_csv
-        self.target_labels        = self.TARGET_LABELS
+        self.optimizer_name           = optimizer
+        self.optimizer_options        = dict(optimizer_options or {'lr': 1e-4})
+        self.time_limit_minutes       = time_limit_minutes
+        self.alpha                    = alpha
+        self.flair_stats_csv          = flair_stats_csv
+        self.target_labels            = self.TARGET_LABELS
+        self.val_diagnostics_interval = val_diagnostics_interval
 
         # ── Sub-modules ───────────────────────────────────────────────────────
-        self.subject_params_cache   = self._load_subject_params()
-        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
-        synth                       = self._build_synth(flair_modality)
-        loss_fn                     = self._build_loss(loss)
-        self.network                = SynthSeg(seg_net, synth, loss_fn)
-        self.intensity_aug          = self._build_intensity_aug()
-        self.fcd_aug                = FCDAugmentations()
+        self.subject_params_cache     = self._load_subject_params()
+        seg_net                       = self._build_seg_network(ndim, nb_classes, seg_features, seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        synth                         = self._build_synth(flair_modality)
+        loss_fn                       = self._build_loss(loss)
+        self.network                  = SynthSeg(seg_net, synth, loss_fn)
+        self.intensity_aug            = self._build_intensity_aug()
+        self.rimg_normalizer          = cc.QuantileTransform(clip=True)
+        self.fcd_aug                  = FCDAugmentations()
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        _m                  = dict(include_background=False, num_classes=nb_classes, input_format='index')
-        self.val_dice       = dice_compute(average='micro', **_m)
-        self.val_dice_fcd   = dice_compute(average='none',  **_m)
+        _m                            = dict(include_background=False, num_classes=nb_classes, input_format='index')
+        self.val_dice                 = dice_compute(average='micro', **_m)
+        self.val_dice_fcd             = dice_compute(average='none',  **_m)
 
         # ── Manual optimisation ───────────────────────────────────────────────
-        self.automatic_optimization = False
+        self.automatic_optimization   = False
         self.network.set_backward(self.manual_backward)
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.n_best_batches    = n_best_batches
-        self._val_batch_cache  = []
+        self.n_tracked_batches        = n_tracked_batches
+        self._val_batch_cache         = []   # top-n_tracked_batches entries by lowest loss
+        self._val_worst_cache         = []   # top-n_tracked_batches entries by highest loss
+        self._val_all_subj_metrics    = []   # all subjects across all val batches this epoch
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -897,7 +943,7 @@ class Model(pl.LightningModule):
         print(f"  modality        : {modality}")
 
         total_params = sum(p.numel() for p in seg.parameters())
-        trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
+        trainable    = sum(p.numel() for p in seg.parameters() if p.requires_grad)
         print(f"  Total params    : {total_params:,}")
         print(f"  Trainable params: {trainable:,}")
 
@@ -926,8 +972,12 @@ class Model(pl.LightningModule):
             print(f"  Subjects to debug      : {sorted(dbg.debug_subject_ids)}")
             print(f"  Output root            : {dbg.output_root}")
             print(f"  Save once per subject  : {dbg.save_once}")
-            print(f"  Stages saved           : 0=inputs, 1=synth, 2=clamp(flair), "
-                  f"3=fcd_aug(non-native), 4=intensity, 5=label_fusion(non-native)")
+            if self.hparams.native_synthesis:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"3=intensity, 5=rimg_intensity")
+            else:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"2=fcd_aug, 3=intensity, 4=label_fusion, 5=rimg_intensity")
         else:
             print(f"\n  Pipeline Debugger      : DISABLED (no debug_subject_ids set)")
 
@@ -940,10 +990,10 @@ class Model(pl.LightningModule):
         if not (self.flair_stats_csv and os.path.exists(self.flair_stats_csv)):
             return cache
         try:
-            df = pd.read_csv(self.flair_stats_csv)
+            df            = pd.read_csv(self.flair_stats_csv)
             df['subject'] = df['subject'].astype(str).str.strip()
             # range(19): covers classes 0–18 inclusive (WM-GM Separator = 18)
-            default_keys = set(range(19)) | set(FLAIR_CLASS_PARAMS.keys())
+            default_keys  = set(range(19)) | set(FLAIR_CLASS_PARAMS.keys())
 
             for subj in df['subject'].unique():
                 params = {
@@ -964,8 +1014,7 @@ class Model(pl.LightningModule):
             print(f'[Model] Warning: failed to parse CSV — {exc}')
         return cache
 
-    def _build_seg_network(self, ndim, nb_classes, features, activation,
-                           nb_levels, nb_conv, norm):
+    def _build_seg_network(self, ndim, nb_classes, features, activation, nb_levels, nb_conv, norm):
         backbone = UNet(ndim, nb_features=features, activation=activation,
                         nb_levels=nb_levels, nb_conv=nb_conv, norm=norm)
         return SegNet(ndim, 1, nb_classes, backbone=backbone, activation=None)
@@ -1021,7 +1070,7 @@ class Model(pl.LightningModule):
         if self.hparams.flair_modality:
             if self.hparams.native_synthesis:
                 params = dict(params)
-                if 21 not in params:   # only uses lesion_gmm_params as fallback if 21 not in CSV
+                if 21 not in params:  # only uses lesion_gmm_params as fallback if 21 not in CSV
                     params[21] = self.lesion_gmm_params
             self.network.synth.set_class_params(params)
 
@@ -1035,22 +1084,88 @@ class Model(pl.LightningModule):
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
 
-    def _apply_fcd_augmentations(self, img: torch.Tensor, roi: torch.Tensor,
-                                 choices: list, params: dict) -> torch.Tensor:
-        """Apply the FCD augmentation chain. Returns a new tensor."""
+    @staticmethod
+    def _fmt_lr(lr: float) -> str:
+        """Format learning rate in math notation e.g. 1.00×10⁻⁴"""
+        s = f"{lr:.2e}"
+        return re.sub(
+            r"e([+-])0*(\d+)",
+            lambda m: f"×10{'⁻' if m.group(1) == '-' else '⁺'}"
+                      f"{''.join('⁰¹²³⁴⁵⁶⁷⁸⁹'[int(d)] for d in m.group(2))}",
+            s
+        )
+
+    def _apply_fcd_augmentations(
+            self,
+            img: torch.Tensor,
+            roi: torch.Tensor,
+            choices: list,
+            params: dict,
+    ) -> tuple:
+        """
+        Apply the FCD augmentation chain with pre-sampled random parameters.
+
+        All random values are drawn here — once per subject, before any
+        augmentation method is invoked — so every subject is guaranteed a
+        statistically independent sample regardless of augmentation order.
+
+        Parameters
+        ----------
+        img     : (Z, Y, X) synthetic image tensor on GPU
+        roi     : (Z, Y, X) binary ROI mask on GPU
+        choices : list of augmentation names, e.g. ['blur', 'hyper']
+        params  : dict of (min, max) range tuples from the batch:
+                    'int_rng'     → intensity_range for hyper / trans
+                    'blur_sigma'  → sigma_range for blur
+                    'zoom_f'      → zoom_factor range
+                    'hyper_sigma' → sigma_range for hyper
+                    'trans_sigma' → sigma_range for trans
+                    'tail_length' → (min_int, max_int) for trans tail
+
+        Returns
+        -------
+        img : augmented image tensor
+        roi : (possibly updated) ROI mask tensor
+        """
+        # ── Pre-sample every random scalar up-front ──────────────────────────────
+        # Each draw is independent; order does not affect the values.
+        pre = {
+            'blur_sigma':       random.uniform(*params['blur_sigma']),
+            'zoom_factor':      random.uniform(*params['zoom_f']),
+            'hyper_intensity':  random.uniform(*params['int_rng']),
+            'hyper_sigma':      random.uniform(*params['hyper_sigma']),
+            'trans_intensity':  random.uniform(*params['int_rng']),
+            'trans_sigma':      random.uniform(*params['trans_sigma']),
+        }
+
+        # ── Apply augmentations using the pre-sampled values ─────────────────────
         for ch in choices:
             if ch == 'zoom':
                 img, roi = self.fcd_aug.apply_roi_thickening(
-                    img, roi, zoom_range=params['zoom_f'])
+                    img, roi,
+                    zoom_factor=pre['zoom_factor'],
+                )
+
+            elif ch == 'blur':
+                img = self.fcd_aug.apply_roi_augmentations_blured(
+                    img, roi,
+                    sigma=pre['blur_sigma'],
+                )
+
             elif ch in ('hyper', 'trans'):
                 img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
-                    intensity_range=params['int_rng'],
-                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'],
+                    intensity_factor=pre['hyper_intensity'],
+                    sigma=pre['hyper_sigma'],
                 )
-            elif ch == 'blur':
-                img = self.fcd_aug.apply_roi_augmentations_blured(
-                    img, roi, sigma_range=params['blur_sigma'])
+            # ── Debug: check for NaN/inf after every augmentation step ──────────
+            if not torch.isfinite(img).all():
+                bad = (~torch.isfinite(img)).sum().item()
+                print(f"[NaN DETECTED] after aug='{ch}' | bad_voxels={bad} "
+                      f"| params={pre}")
+                # Return the pre-augmentation image to avoid propagating NaN
+                return img, roi
+
         return img, roi
 
     def _process_single_sample(self, batch: dict, i: int):
@@ -1059,6 +1174,18 @@ class Model(pl.LightningModule):
         native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
         native_synthesis=True  : SharedSynth (fusedmask) → IntensityTransform  (no aug, no fusion)
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
+
+        simg normalization
+        ──────────────────
+        simg exits SharedSynth already in [0, 1] regardless of path:
+        - flair_modality=True  : QuantileTransform(clip=True) applied inside
+                                 SynthFromLabelTransform after GMM (no_augs=True path)
+        - flair_modality=False : cc.IntensityTransform ends with QuantileTransform
+
+        rimg normalization
+        ──────────────────
+        rimg is the real FLAIR from disk (~0–245). Normalized here via
+        QuantileTransform(clip=True) before IntensityTransform, matching simg's scale.
 
         Debug instrumentation
         ─────────────────────
@@ -1071,7 +1198,7 @@ class Model(pl.LightningModule):
         roi_t      = batch['roi_t'][i]
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
-        
+
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
         input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
@@ -1106,27 +1233,39 @@ class Model(pl.LightningModule):
                     subject_id, simg, slab_out, rimg, rlab_out, rroi=None
                 )
 
-            simg_3d = simg.squeeze(0).float()
+            # simg exits SharedSynth already in [0,1] — no manual normalization needed
+            simg_3d        = simg.squeeze(0).float()
 
-            if self.hparams.flair_modality:
-                simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
-                # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────
-                if is_debug:
-                    dbg.save_stage2_after_clamp(subject_id, simg_3d)
-
-            aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
+            aug_out        = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
-            # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────
+            # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────
+            if not torch.isfinite(aug_image_item).all():
+                bad = (~torch.isfinite(aug_image_item)).sum().item()
+                print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
+                      f"for subject={subject_id} — skipping sample")
+                return None
+
+            # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────
             if is_debug:
-                dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+                dbg.save_stage3_after_intensity(subject_id, aug_image_item)
                 dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
+            rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+            rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
+            rimg_out  = self.intensity_aug(rimg_norm)
+            rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+
+            # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
+            if is_debug:
+                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+                dbg.mark_saved(subject_id)
+
             return (
                 aug_image_item,
                 slab_out.long(),
-                rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
+                rimg_norm,
                 rlab_out.long(),
             )
 
@@ -1148,55 +1287,74 @@ class Model(pl.LightningModule):
         if is_debug:
             dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
 
-        if self.hparams.flair_modality:
-            simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
-            # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────────
-            if is_debug:
-                dbg.save_stage2_after_clamp(subject_id, simg_3d)
-
-        choices = self._parse_aug_choices(aug_type)
+        choices          = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # ── Debug: Stage 3 — after FCDAugmentations ───────────────────────────────
+        # ── Debug: Stage 2 — after FCDAugmentations ───────────────────────────────
         if is_debug:
-            dbg.save_stage3_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
+            dbg.save_stage2_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
 
-        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
+        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
-        # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────────
-        if is_debug:
-            dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+        # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
+        if not torch.isfinite(aug_image_item).all():
+            bad = (~torch.isfinite(aug_image_item)).sum().item()
+            print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
+                  f"for subject={subject_id}, aug={choices} — skipping sample")
+            return None
 
-        slab_with_fcd = slab_3d.clone()
+        # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────────
+        if is_debug:
+            dbg.save_stage3_after_intensity(subject_id, aug_image_item)
+
+        slab_with_fcd              = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
-        rlab_with_fcd = rlab.long().squeeze(0).clone()
+        rlab_with_fcd              = rlab.long().squeeze(0).clone()
         rlab_with_fcd[rroi_3d > 0] = 6
 
-        # ── Debug: Stage 5 — after label fusion ───────────────────────────────────
+        # ── Debug: Stage 4 — after label fusion ───────────────────────────────────
         if is_debug:
-            dbg.save_stage5_label_fusion(
+            dbg.save_stage4_label_fusion(
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
-    
+
+        rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+        rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
+        rimg_out  = self.intensity_aug(rimg_norm)
+        rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+
+        # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────────
+        if is_debug:
+            dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+
         return (
             aug_image_item,
             slab_with_fcd.unsqueeze(0),
-            rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
+            rimg_norm,
             rlab_with_fcd.unsqueeze(0),
         )
-    
+
     def synthesize_batch(self, batch: dict):
-        """Run the synthesis pipeline for every sample. Returns stacked tensors."""
+        """
+        Run the synthesis pipeline for every sample in the batch.
+        Returns stacked tensors + a list of subject_ids that survived synthesis
+        (samples that returned None are excluded from both).
+        """
         results     = []
+        subject_ids = []
+        n           = len(batch['label_t'])
+        sid_list    = batch.get('subject_id', [None] * n)
         device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+
         with torch.autocast(device_type=device_type, enabled=False):
-            for i in range(len(batch['label_t'])):
+            for i in range(n):
                 out = self._process_single_sample(batch, i)
                 if out is not None:
                     results.append(out)
+                    subject_ids.append(sid_list[i])
             if not results:
                 return None
 
@@ -1206,6 +1364,7 @@ class Model(pl.LightningModule):
             torch.stack(aug_masks).long(),
             torch.stack(real_images).float(),
             torch.stack(real_masks).long(),
+            subject_ids,                        # ← list of str|None, same length as batch dim
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1214,19 +1373,20 @@ class Model(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Periodically free CUDA cache to prevent fragmentation over long runs
-        if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
         result = self.synthesize_batch(batch)
         if result is None:
             return None
-        aug_image, aug_mask, real_image, real_mask = result
+        aug_image, aug_mask, real_image, real_mask, _ = result  # subject_ids unused in training
 
         loss_synth, loss_real = self.network.train_step(
             aug_image, aug_mask, real_image, real_mask)
 
-        loss = loss_synth + self.alpha * loss_real
-        self.log('train_loss', loss, prog_bar=True)
+        loss              = loss_synth + self.alpha * loss_real
+        actual_batch_size = aug_image.shape[0]
+        self.log('train_loss', loss, prog_bar=True, batch_size=actual_batch_size)
         return loss
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1238,39 +1398,118 @@ class Model(pl.LightningModule):
             result = self.synthesize_batch(batch)
             if result is None:
                 return None
-            aug_image, aug_mask, real_image, real_mask = result
+            aug_image, aug_mask, real_image, real_mask, subject_ids = result
 
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
 
-        pred_labels   = pred_real.cpu().argmax(dim=1)
-        target_labels = real_mask.cpu().squeeze(1).long()
+        pred_labels       = pred_real.cpu().argmax(dim=1)
+        target_labels     = real_mask.cpu().squeeze(1).long()
 
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
-        loss = loss_synth + self.alpha * loss_real
-        self.log('eval_loss', loss, prog_bar=True)
+        loss              = loss_synth + self.alpha * loss_real
+        actual_batch_size = aug_image.shape[0]
 
-        # Cache for top-N best-batch NIfTI diagnostics
-        self._val_batch_cache.append({
+        self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
+
+        # ── Per-subject metrics ────────────────────────────────────────────────────
+        # Computes Dice + FCD Dice per subject for cache and optional logging.
+        # Logging only fires every val_diagnostics_interval epochs.
+        _m           = dict(include_background=False, num_classes=self.hparams.nb_classes, input_format='index')
+        subj_metrics = []
+
+        for j, subj_id in enumerate(subject_ids):
+            if subj_id is None:
+                continue
+
+            subj_pred_labels = pred_labels[j:j + 1]
+            subj_target      = target_labels[j:j + 1]
+            subj_pred_logits = pred_real[j:j + 1]
+            subj_mask        = real_mask[j:j + 1]
+
+            # Dice — fresh metric instance to avoid state bleed between subjects
+            _dice = dice_compute(average='micro', **_m)
+            _dice.update(subj_pred_labels, subj_target)
+            subj_dice = _dice.compute().item()
+
+            # FCD Dice (class 6 = index 5)
+            _dice_fcd = dice_compute(average='none', **_m)
+            _dice_fcd.update(subj_pred_labels, subj_target)
+
+            subj_dice_per_cls = _dice_fcd.compute()
+            subj_fcd          = subj_dice_per_cls[5].item() if len(subj_dice_per_cls) > 5 else 0.0
+
+            subj_metrics.append({'id': subj_id, 'dice': subj_dice, 'fcd': subj_fcd})
+
+            # ── Log every val_diagnostics_interval epochs ──────────────────────────
+            if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
+                subj_loss = self.network.loss(subj_pred_logits, subj_mask)
+                self.log(f'val_dice_{subj_id}', subj_dice,        prog_bar=False)
+                self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
+
+        # ── Accumulate all subjects across batches for epoch-end CSV + print ──────
+        if subj_metrics:
+            self._val_all_subj_metrics.extend(subj_metrics)
+
+        # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
+        entry = {
             'pred_synth':    pred_synth.cpu(),
             'pred_labels':   pred_labels,
             'aug_image':     aug_image.cpu(),
             'real_image':    real_image.cpu(),
             'aug_mask':      aug_mask.cpu(),
             'target_labels': target_labels,
-            'score':         -loss.item(),   # lower loss = higher score
+            'score':         -loss.item(),  # higher score = lower loss = better
             'batch_idx':     batch_idx,
-        })
+            'subject_ids':   subject_ids,
+            'subj_metrics':  subj_metrics,
+        }
+
+        # Guard against None from checkpoint resume with renamed hparam (was n_best_batches)
+        n = self.hparams.n_tracked_batches or 2
+
+        # Best cache: keep top-n by highest score (lowest loss)
+        self._val_batch_cache.append(entry)
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
-        self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
+        self._val_batch_cache = self._val_batch_cache[:n]
+
+        # Worst cache: keep top-n by lowest score (highest loss),
+        # excluding any batch already in the best cache to avoid overlap
+        best_idxs             = {e['batch_idx'] for e in self._val_batch_cache}
+
+        self._val_worst_cache.append(entry)
+        self._val_worst_cache.sort(key=lambda x: x['score'])   # ascending = worst first
+        self._val_worst_cache = [
+            e for e in self._val_worst_cache if e['batch_idx'] not in best_idxs
+        ][:n]
 
         return loss
 
-    def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image,
-                             real_image, aug_mask, real_labels, suffix=''):
-        """Log class-count scalars and save NIfTI samples every 20 epochs."""
+    def _log_val_diagnostics(
+            self,
+            pred_synth,
+            pred_labels,
+            aug_image,
+            real_image,
+            aug_mask,
+            real_labels,
+            subject_id: str = 'unknown',
+            rank: str       = 'best',
+    ):
+        """
+        Log class-count scalars and save NIfTI samples every 10 epochs.
+
+        NIfTIs are written to:
+            <log_dir>/images/epoch-<XXXX>/<rank>_<subject_id>/
+                synth-pred.nii.gz
+                synth-image.nii.gz
+                synth-ref.nii.gz
+                real-pred.nii.gz
+                real-image.nii.gz
+                real-ref.nii.gz
+        """
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
         pred_real_argmax  = pred_labels[0]
         self.log('pred_synth_num_classes',
@@ -1278,26 +1517,25 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes',
                  float(len(torch.unique(pred_real_argmax))),  prog_bar=False)
 
-        if self.trainer.current_epoch % 20 != 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval != 0:
             return
 
-        base_dir = self.trainer.log_dir or self.trainer.default_root_dir
-        img_root = os.path.join(base_dir, 'images')
-        makedirs(img_root, exist_ok=True)
-        print(f'\n[Saving] NIfTI diagnostics — Epoch {self.trainer.current_epoch}'
-              f' {suffix} → {img_root}')
+        base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
+        epoch_dir = os.path.join(base_dir, 'images', f'epoch-{self.trainer.current_epoch:04d}')
+        subj_dir  = os.path.join(epoch_dir, f'{rank}_{subject_id}')
+        makedirs(subj_dir, exist_ok=True)
 
-        p = f'{img_root}/epoch-{self.trainer.current_epoch:04d}'
-        save(pred_synth_argmax,                  f'{p}_{suffix}_synth-pred.nii.gz')
-        save(pred_real_argmax,                   f'{p}_{suffix}_real-pred.nii.gz')
-        save(aug_image[0].squeeze(0),            f'{p}_{suffix}_synth-image.nii.gz')
-        save(real_image[0].squeeze(0),           f'{p}_{suffix}_real-image.nii.gz')
-        save(aug_mask[0].squeeze(0).to(torch.uint8),  f'{p}_{suffix}_synth-ref.nii.gz')
-        save(real_labels[0].to(torch.uint8),     f'{p}_{suffix}_real-ref.nii.gz')
+        save(pred_synth_argmax,                       os.path.join(subj_dir, 'synth-pred.nii.gz'))
+        save(pred_real_argmax,                        os.path.join(subj_dir, 'real-pred.nii.gz'))
+        save(aug_image[0].squeeze(0),                 os.path.join(subj_dir, 'synth-image.nii.gz'))
+        save(real_image[0].squeeze(0),                os.path.join(subj_dir, 'real-image.nii.gz'))
+        save(aug_mask[0].squeeze(0).to(torch.uint8),  os.path.join(subj_dir, 'synth-ref.nii.gz'))
+        save(real_labels[0].to(torch.uint8),          os.path.join(subj_dir, 'real-ref.nii.gz'))
 
     def on_validation_epoch_end(self):
-        # Save NIfTI diagnostics for the best N cached batches
-        for i, bd in enumerate(self._val_batch_cache):
+        # ── Save NIfTI diagnostics for best N + worst N cached batches ───────────
+        for bd in self._val_batch_cache:
+            subject_id = bd['subject_ids'][0] if bd['subject_ids'] else 'unknown'
             self._log_val_diagnostics(
                 bd['pred_synth'].to(self.device),
                 bd['pred_labels'],
@@ -1305,41 +1543,83 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                suffix=f'_best{i}_batch{bd["batch_idx"]}',
+                subject_id = subject_id,
+                rank       = 'best',
             )
-        self._val_batch_cache = []
 
-        dice_epoch = self.val_dice.compute()
+        for bd in self._val_worst_cache:
+            subject_id = bd['subject_ids'][0] if bd['subject_ids'] else 'unknown'
+            self._log_val_diagnostics(
+                bd['pred_synth'].to(self.device),
+                bd['pred_labels'],
+                bd['aug_image'].to(self.device),
+                bd['real_image'].to(self.device),
+                bd['aug_mask'].to(self.device),
+                bd['target_labels'],
+                subject_id = subject_id,
+                rank       = 'worst',
+            )
+
+        # ── Epoch-level metrics ───────────────────────────────────────────────────
+        dice_epoch   = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
-        dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
+        dice_fcd     = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
 
         self.log('val_dice',     dice_epoch, prog_bar=True)
         self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
-        tl = self.trainer.callback_metrics.get('train_loss', -1)
-        el = self.trainer.callback_metrics.get('eval_loss',  -1)
+        # ── Step LR scheduler manually (required with automatic_optimization=False) ──
+        sch = self.lr_schedulers()
+        if sch is not None:
+            sch.step(self.trainer.callback_metrics.get('eval_loss'))
+
+        tl         = self.trainer.callback_metrics.get('train_loss', -1)
+        el         = self.trainer.callback_metrics.get('eval_loss', -1)
+        current_lr = self.optimizers().param_groups[0]['lr']
+
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
+        print(f"  LR            : {self._fmt_lr(current_lr)}")
         print(f"  Train Loss    : {float(tl):.4f}")
         print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
+
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 \
+                and self._val_all_subj_metrics:
+            print(f"  ── Subject Diagnostics ────────────────")
+            for m in self._val_all_subj_metrics:
+                print(f"  {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
+
+            # ── Write all subjects to CSV ─────────────────────────────────────────
+            base_dir = self.trainer.log_dir or self.trainer.default_root_dir
+            csv_path = os.path.join(base_dir, 'subject_metrics.csv')
+            row = {'epoch': self.trainer.current_epoch}
+            for m in self._val_all_subj_metrics:
+                row[f"{m['id']} (dice)"]     = round(m['dice'], 4)
+                row[f"{m['id']} (fcd_dice)"] = round(m['fcd'],  4)
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+
         print(f"{'=' * 40}\n")
 
-        # Log current LR from the scheduler Lightning manages
-        current_lr = self.optimizers().param_groups[0]['lr']
-        print(f'  LR            : {current_lr:.2e}')
+        self._val_batch_cache      = []
+        self._val_worst_cache      = []
+        self._val_all_subj_metrics = []
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
-
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Optimiser / callbacks / inference
     # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls = getattr(optim, self.optimizer_name)
+        opt_cls   = getattr(optim, self.optimizer_name)
         optimizer = opt_cls(self.network.segnet.parameters(),
                             **(self.optimizer_options or {}))
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1363,7 +1643,6 @@ class Model(pl.LightningModule):
 
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
-
 def save(dat, fname):
     dat = dat.detach().cpu().numpy()
     h = nib.Nifti1Header()
@@ -1612,90 +1891,25 @@ class LossGraphCallback(Callback):
             finally:
                 plt.close()
 
-            print(f"[LossGraph] Updated plot → {plot_path}")
-
         except Exception as e:
             print(f"[LossGraph] ❌ Error at epoch {trainer.current_epoch}: "
                   f"{type(e).__name__}: {e}")
             traceback.print_exc()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EveryEpochCheckpointCallback
-# ──────────────────────────────────────────────────────────────────────────────
-#  Writes checkpoints/<filename> unconditionally after every training epoch.
-#  Does not depend on ModelCheckpoint, metric improvements, or save_last logic.
-#  This is the canonical file used for resuming.
-#
-#  Uses trainer.save_checkpoint() directly — bypasses all of ModelCheckpoint's
-#  link/top-k/metric-gating logic.
-# ══════════════════════════════════════════════════════════════════════════════
-class EveryEpochCheckpointCallback(Callback):
-    def __init__(self, filename="resume.ckpt"):
-        self.filename = filename
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        ckpt_dir = os.path.join(trainer.default_root_dir, "checkpoints")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(ckpt_dir, self.filename)
-        try:
-            trainer.save_checkpoint(ckpt_path)
-            size_mb = os.path.getsize(ckpt_path) / 1e6
-            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(ckpt_path))
-            print(f"[EveryEpoch] ✅ epoch={trainer.current_epoch} → "
-                  f"{ckpt_path} ({size_mb:.1f} MB, mtime {mtime})")
-        except Exception as e:
-            print(f"[EveryEpoch] ❌ Save FAILED at epoch "
-                  f"{trainer.current_epoch}: {type(e).__name__}: {e}")
-            traceback.print_exc()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  CheckpointTraceCallback
 # ──────────────────────────────────────────────────────────────────────────────
-#  Diagnostic callback — verifies resume.ckpt and last.ckpt behave as expected
-#  each epoch. Fires after EveryEpochCheckpointCallback so resume.ckpt is
+#  Diagnostic callback — verifies last.ckpt and last.ckpt behave as expected
+#  each epoch. Fires after EveryEpochCheckpointCallback so last.ckpt is
 #  already written when we inspect it.
 # ══════════════════════════════════════════════════════════════════════════════
 class CheckpointTraceCallback(Callback):
 
-    def on_validation_epoch_start(self, trainer, pl_module):
-        print(f"\n[CKPT TRACE] === Epoch {trainer.current_epoch}: validation starting ===")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: validation hooks running. "
-              f"Disk free={free / 1e9:.2f}GB, should_stop={trainer.should_stop}")
-
     def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch
         mc = next((cb for cb in trainer.callbacks
                    if type(cb).__name__ == "ModelCheckpoint"), None)
         if mc is None:
-            print(f"[CKPT TRACE] Epoch {epoch}: no ModelCheckpoint found!")
-            return
-
-        ckpt_dir = mc.dirpath or os.path.join(trainer.log_dir or '.', 'checkpoints')
-        print(f"[CKPT TRACE] Epoch {epoch}: post-epoch checkpoint state:")
-        print(f"  ModelCheckpoint.last_model_path  = {mc.last_model_path}")
-        print(f"  ModelCheckpoint.best_model_path  = {mc.best_model_path}")
-        print(f"  ModelCheckpoint.best_model_score = {mc.best_model_score}")
-
-        if os.path.isdir(ckpt_dir):
-            for fname, label in [('resume.ckpt', 'resume.ckpt'), ('last.ckpt', 'last.ckpt  ')]:
-                fpath = os.path.join(ckpt_dir, fname)
-                if os.path.exists(fpath):
-                    mb = os.path.getsize(fpath) / 1e6
-                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
-                    print(f"  {label} on disk: {mb:.1f} MB, mtime {mtime}")
-                else:
-                    print(f"  {label} DOES NOT EXIST on disk")
-
-            n_ckpts = len([f for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')])
-            print(f"  total ckpt files   : {n_ckpts}")
-
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"  disk free          = {free / 1e9:.2f}GB")
+            print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: no ModelCheckpoint found!")
 
     def on_exception(self, trainer, pl_module, exception):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
@@ -1703,19 +1917,17 @@ class CheckpointTraceCallback(Callback):
 
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
-
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
         parser.set_defaults({
-            "checkpoint.monitor": "eval_loss",
-            "checkpoint.save_last": True,
-            "checkpoint.save_top_k": 1,
-            "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
+            "checkpoint.monitor":        "eval_loss",
+            "checkpoint.save_last":      True,
+            "checkpoint.save_top_k":     1,
+            "checkpoint.filename":       "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
-        parser.link_arguments("model.native_synthesis", "data.native_synthesis")  # ← add
-
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
@@ -1723,7 +1935,8 @@ class CLI(LightningCLI):
             f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
         default_root = kwargs.get("default_root_dir", "experiments")
-        save_dir = os.path.join(default_root, run_name)
+        save_dir     = os.path.join(default_root, run_name)
+        ckpt_dir     = os.path.join(save_dir, "checkpoints")
         makedirs(save_dir, exist_ok=True)
 
         print(f"[System] Initializing Run: {run_name}")
@@ -1736,21 +1949,38 @@ class CLI(LightningCLI):
 
         cbs = kwargs.get("callbacks", []) or []
 
-        # Registration order matters: EveryEpoch writes resume.ckpt first,
+        # Registration order matters: EveryEpoch writes last.ckpt first,
         # then CheckpointTrace inspects it, then LossGraph plots.
-        cbs.append(EveryEpochCheckpointCallback(filename="resume.ckpt"))
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
+
+        # ── Additional checkpoints ────────────────────────────────────────────
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-{epoch:02d}-{val_dice:.2f}",
+        ))
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice_fcd",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-fcd-{epoch:02d}-{val_dice_fcd:.2f}",
+        ))
 
         print("\n[CLI] Registered callbacks:")
         for i, cb in enumerate(cbs):
             print(f"  [{i}] {type(cb).__name__}")
         print()
 
-        kwargs["default_root_dir"] = save_dir
-        kwargs["enable_progress_bar"] = False
-        kwargs["logger"] = logger
-        kwargs["callbacks"] = cbs
+        kwargs["default_root_dir"]      = save_dir
+        kwargs["enable_progress_bar"]   = False
+        kwargs["logger"]                = logger
+        kwargs["callbacks"]             = cbs
         return super().instantiate_trainer(**kwargs)
 
 

@@ -44,8 +44,4 @@ logs/
 *.pth
 *.pt
 
-
-notebooks/old_versions/
-scripts/synthFCD/old_versions/
-
 experiments/
