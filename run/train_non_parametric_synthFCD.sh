@@ -31,6 +31,7 @@ python ../scripts/train_non_parametric_synthFCD.py fit \
   --model.seg_features "[16,32,64,128,256,512]" \
   --model.time_limit_minutes "$TRAINING_TIME_MINUTES" \
   --model.val_diagnostics_interval 10 \
+  --model.use_lr_scheduler false \
   --model.debug_subject_ids '["sub-00001", "sub-00033", "sub-00044", "sub-00002", "sub-00058", "sub-00065"]' \
   \
   --trainer.default_root_dir "$EXPERIMENTS_DIR" \

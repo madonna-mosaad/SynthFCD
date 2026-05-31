@@ -864,8 +864,10 @@ class Model(pl.LightningModule):
             n_tracked_batches: int = 2,
             native_synthesis: bool = False,
             val_diagnostics_interval: int = 10,
+            use_lr_scheduler: bool = False,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
+            prob_map_subject_ids: Optional[list] = None,  # subject IDs to save FCD prob maps for
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -894,6 +896,7 @@ class Model(pl.LightningModule):
         self.flair_stats_csv          = flair_stats_csv
         self.target_labels            = self.TARGET_LABELS
         self.val_diagnostics_interval = val_diagnostics_interval
+        self.use_lr_scheduler         = use_lr_scheduler
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache     = self._load_subject_params()
@@ -904,7 +907,6 @@ class Model(pl.LightningModule):
         self.intensity_aug            = self._build_intensity_aug()
         self.rimg_normalizer          = cc.QuantileTransform(clip=True)
         self.fcd_aug                  = FCDAugmentations()
-
         # ── Metrics ───────────────────────────────────────────────────────────
         _m                            = dict(include_background=False, num_classes=nb_classes, input_format='index')
         self.val_dice                 = dice_compute(average='micro', **_m)
@@ -919,6 +921,13 @@ class Model(pl.LightningModule):
         self._val_batch_cache         = []   # top-n_tracked_batches entries by lowest loss
         self._val_worst_cache         = []   # top-n_tracked_batches entries by highest loss
         self._val_all_subj_metrics    = []   # all subjects across all val batches this epoch
+
+        # ── FCD probability maps (opt-in subjects) ────────────────────────────
+        # Saves P(FCD) NIfTIs for these subjects every val_diagnostics_interval
+        # epochs.  Empty set → disabled (nothing saved).
+        #   --model.prob_map_subject_ids '["sub-00001", "sub-00033"]'
+        self.prob_map_subject_ids     = set(prob_map_subject_ids or [])
+        self._val_prob_cache          = []   # {subject_id, real_prob, synth_prob} per save epoch
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -980,6 +989,14 @@ class Model(pl.LightningModule):
                       f"2=fcd_aug, 3=intensity, 4=label_fusion, 5=rimg_intensity")
         else:
             print(f"\n  Pipeline Debugger      : DISABLED (no debug_subject_ids set)")
+
+        # ── FCD Probability Maps ──────────────────────────────────────────────
+        if self.prob_map_subject_ids:
+            print(f"\n  FCD Prob Maps          : ENABLED for {sorted(self.prob_map_subject_ids)}")
+            print(f"  Saved every            : {self.val_diagnostics_interval} epochs  "
+                  f"(real + synth P(FCD) → images/epoch-XXXX/prob_<subject_id>/)")
+        else:
+            print(f"  FCD Prob Maps          : DISABLED (no prob_map_subject_ids set)")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Private builders  (called only from __init__)
@@ -1453,6 +1470,23 @@ class Model(pl.LightningModule):
         if subj_metrics:
             self._val_all_subj_metrics.extend(subj_metrics)
 
+        # ── FCD probability-map cache (opt-in subjects, save epochs only) ─────────
+        # pred_real / pred_synth are raw logits (SegNet built with activation=None);
+        # softmax(.., dim=1)[:, 6] is P(class 6 = FCD lesion).  NB: channel 6 here,
+        # NOT 5 — the raw output keeps the background channel (dice drops it → 5).
+        # Cache only the single FCD channel on CPU to keep memory minimal.
+        if self.prob_map_subject_ids \
+                and self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
+            real_prob_fcd  = torch.softmax(pred_real,  dim=1)[:, 6]   # (B, D, H, W)
+            synth_prob_fcd = torch.softmax(pred_synth, dim=1)[:, 6]   # (B, D, H, W)
+            for j, subj_id in enumerate(subject_ids):
+                if subj_id in self.prob_map_subject_ids:
+                    self._val_prob_cache.append({
+                        'subject_id': subj_id,
+                        'real_prob':  real_prob_fcd[j].cpu(),
+                        'synth_prob': synth_prob_fcd[j].cpu(),
+                    })
+
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
         entry = {
             'pred_synth':    pred_synth.cpu(),
@@ -1560,6 +1594,20 @@ class Model(pl.LightningModule):
                 rank       = 'worst',
             )
 
+        # ── Save FCD probability maps for opt-in subjects ─────────────────────────
+        # Written to <log_dir>/images/epoch-<XXXX>/prob_<subject_id>/
+        #   real-prob-fcd.nii.gz   — P(FCD) on the real FLAIR (3D float)
+        #   synth-prob-fcd.nii.gz  — P(FCD) on the synthetic image (3D float)
+        # The cache is only populated on save epochs, so this is a no-op otherwise.
+        if self._val_prob_cache:
+            base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
+            epoch_dir = os.path.join(base_dir, 'images', f'epoch-{self.trainer.current_epoch:04d}')
+            for pc in self._val_prob_cache:
+                prob_dir = os.path.join(epoch_dir, f"prob_{pc['subject_id']}")
+                makedirs(prob_dir, exist_ok=True)
+                save(pc['real_prob'],  os.path.join(prob_dir, 'real-prob-fcd.nii.gz'))
+                save(pc['synth_prob'], os.path.join(prob_dir, 'synth-prob-fcd.nii.gz'))
+
         # ── Epoch-level metrics ───────────────────────────────────────────────────
         dice_epoch   = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
@@ -1610,6 +1658,7 @@ class Model(pl.LightningModule):
         self._val_batch_cache      = []
         self._val_worst_cache      = []
         self._val_all_subj_metrics = []
+        self._val_prob_cache       = []
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
@@ -1619,9 +1668,13 @@ class Model(pl.LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls   = getattr(optim, self.optimizer_name)
+        opt_cls = getattr(optim, self.optimizer_name)
         optimizer = opt_cls(self.network.segnet.parameters(),
                             **(self.optimizer_options or {}))
+
+        if not self.hparams.use_lr_scheduler:
+            return optimizer
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-6,
         )
